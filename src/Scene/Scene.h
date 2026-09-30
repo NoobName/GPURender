@@ -42,11 +42,27 @@ private:
     std::vector<InstanceData> m_instances;
 };
 
+// 从 viewProj 提取 6 个**已归一化**的视锥平面（Gribb-Hartmann 方法）。
+//
+// 平面顺序固定为：0 = left, 1 = right, 2 = bottom, 3 = top, 4 = near, 5 = far
+// 法线归一化之后，平面方程的常数项才具有「长度」量纲，
+// 从而可以直接与包围球半径比较（否则两者量纲不一致，剔除结果会出错）。
+//
+// M10 把它单独暴露出来，是为了让 **GPU 与 CPU 使用完全相同的平面数据** ——
+// 这正是「两侧剔除结果应当一致」的前提：排除了「平面提取方式不同」这个变量，
+// 剩下的差异只可能来自浮点运算本身。
+void ExtractFrustumPlanes(DirectX::FXMMATRIX viewProj, DirectX::XMFLOAT4 outPlanes[6]);
+
+// 用**给定的**平面做剔除（不重新提取）。
+// GPU 路径与 CPU 路径共用同一份平面时，对比才有意义。
+void CullInstancesByFrustumWithPlanes(const std::vector<InstanceData>& instances,
+                                      const DirectX::XMFLOAT4 planes[6],
+                                      std::vector<std::uint32_t>& outVisibleIndices);
+
 // CPU 视锥剔除：把 viewProj 的 6 个裁剪平面提取出来，逐个测试实例的包围球。
 //
-// 注意这是 **CPU 侧**的可见性判断，不是 GPU Culling —— M7 只用它来产生 "Visible Count"
-// 这个统计量（以及在按键切换时对比「全部提交」与「只提交可见」的 CPU 成本差异）。
-// GPU 端的剔除是 M9 之后的事。
+// 注意这是 **CPU 侧**的可见性判断。M8 用它产生 Visible Count 统计并驱动
+// CPU-Driven 提交；M10 之后它同时充当 GPU 剔除结果的**参照实现**。
 //
 // outVisibleIndices 按实例原始顺序填充，因此提交顺序仍然是确定性的。
 void CullInstancesByFrustum(const std::vector<InstanceData>& instances,

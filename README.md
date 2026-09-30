@@ -12,7 +12,15 @@
 - **Milestone M6** ✅：基础 Asset Rendering —— 外部 OBJ 网格 + TGA 纹理加载、Mesh / Material / Transform 可复用渲染路径、SRV Descriptor Heap、静态 Sampler、UV 纹理采样、纹理显存驻留。
 - **Milestone M7** ✅：CPU-Driven Large Instance Baseline —— 确定性测试场景（1,000 / 10,000 / 100,000 实例）、InstanceData（world + bounding sphere + mesh/material index）、CPU 循环逐实例提交、CPU 帧时间 / draw call 数 / 可见数统计、屏幕实时统计显示。
 - **Milestone M8** ✅：CPU Frustum Culling Baseline —— 视锥六平面提取（Gribb-Hartmann）、World-Space Bounding Sphere、Plane-Sphere 保守测试、只提交可见实例、剔除耗时与 Culled 统计、Culling Toggle、Frustum / Bounding Sphere 调试可视化、相机可转向。
-- 尚未实现 GPU-Driven 管线（GPU Resident Scene Data、Compute Shader 剔除、ExecuteIndirect 等）。
+- **Milestone M9** ✅：GPU-Resident Scene Instance Data —— 整个场景的实例元数据（变换 / 包围球 / 网格索引 / 材质索引）打包进 DEFAULT Heap 的 `StructuredBuffer`；C++ 与 HLSL 的内存布局契约由 `static_assert` + 运行期三重验证（HLSL `sizeof` 上报、逐实例自洽性检查、逐字节 memcmp）共同保证。
+- **Milestone M10** ✅：GPU Frustum Culling —— 第一个基于 Compute Shader 的 Visibility Pass。`[numthreads(64,1,1)]`，一个线程处理一个实例，做 Bounding Sphere vs Frustum Plane 保守测试。视锥平面经 root constants 传入，并配有完整的 UAV Barrier（WAW / RAW）与资源状态转换。
+- **Milestone M11** ✅：GPU Stream Compaction —— 用 `InterlockedAdd` 把可见实例压缩成紧凑的 `VisibleInstanceIndices[]`，配 `RWByteAddressBuffer` 计数器。计数器每帧在**同一条命令列表内**清零，正常渲染流程**无任何 CPU 同步**。支持把压缩结果回读校验：越界 ID / 重复 ID / 与 CPU 可见集的差异 / 计数越界，四项全部为 0。
+- **Milestone M12** ✅：**ExecuteIndirect —— 第一个真正的 GPU-Driven Rendering Path**。命令生成 CS 写出**一条** `DrawIndexed` 间接命令，其 `InstanceCount` 由 GPU 的可见数决定；顶点着色器用 `SV_InstanceID` 查压缩列表取实例数据。CPU 每帧只提交一次 `ExecuteIndirect`，`MaxCommandCount` 恒为常数 1。
+  - **CPU 提交的 draw call：76,744 → 0**
+  - **`record`（CPU 记录命令耗时）：1.303 ms → 0.087 ms（15×）**
+  - 与 CPU-Driven 逐像素对比：3D 区域 99.998% 相同（9 个像素为深度测试边界差异）
+  - 运行中按 `M` 切换两条路径，或用 `--gpu-driven` 启动
+- 尚未实现遮挡剔除、LOD 与 Meshlet。
 
 ## 技术栈
 
@@ -56,6 +64,12 @@ cmake --build --preset vs2022-debug
 
 程序会打开一个窗口，并在控制台输出所选 GPU 与资源加载信息；关闭窗口即可正常退出。
 
+运行时 DXC 编译需要写入临时 DXIL 和日志文件。程序优先使用 Windows 临时目录
+（由 `TMP` / `TEMP` 等环境变量决定）；若目录不存在或无法写入，会自动回退到
+exe 同级的 `shader-temp/` 目录，并在每次编译结束后清理本次临时文件。
+如果两个位置都不可用，错误日志会分别列出路径和 Windows 错误码。
+`Win32 error 5` 表示访问被拒绝，此时应检查目录写入权限或安全软件的拦截记录。
+
 ## 运行与操作（M7 Stress Test）
 
 程序默认渲染一个由 1,000 个实例组成的**确定性测试场景**，用于建立 CPU-Driven 渲染基线。
@@ -67,6 +81,8 @@ GPUDrivenRenderer.exe --instances 100000              :: 指定实例数量
 GPUDrivenRenderer.exe --instances 100000 --no-cull    :: 提交全部实例（关闭 CPU 剔除）
 GPUDrivenRenderer.exe --instances 100000 --yaw 90     :: 指定初始相机朝向（度）
 GPUDrivenRenderer.exe --instances 2000 --debug-viz 2  :: 调试可视化：0=关 1=视锥 2=视锥+包围球
+GPUDrivenRenderer.exe --compare-cull                  :: 启动时做一次 GPU vs CPU 剔除结果对比
+GPUDrivenRenderer.exe --gpu-driven                    :: 用 ExecuteIndirect 渲染（GPU-Driven）
 GPUDrivenRenderer.exe --help                          :: 查看用法
 ```
 
@@ -80,6 +96,9 @@ GPUDrivenRenderer.exe --help                          :: 查看用法
 | `WASD` / 方向键 | 旋转相机（观察 Visible Count 随视角变化） |
 | `Space` | 切换自动转头 |
 | `R` | 重置到基准视角 |
+| `T` | 在 GPU 上重新验证实例数据（C++ / HLSL 布局一致性） |
+| `G` | 对比 GPU 与 CPU 的可见集（回读压缩列表，校验越界 / 重复 / 集合差异） |
+| `M` | 切换渲染路径：CPU-Driven（逐个实例提交）↔ GPU-Driven（一次 ExecuteIndirect） |
 
 屏幕左上角实时显示：实例总数、可见数、draw call 数，以及分阶段的 CPU 帧时间
 （`update` / `record` / `present`）。控制台每 60 帧输出一行 `[Bench] ...` 便于脚本采集。

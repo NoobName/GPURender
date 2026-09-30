@@ -108,12 +108,8 @@ void Scene::Generate(const SceneConfig& config,
     }
 }
 
-void CullInstancesByFrustum(const std::vector<InstanceData>& instances,
-                            DirectX::FXMMATRIX viewProj,
-                            std::vector<std::uint32_t>& outVisibleIndices)
+void ExtractFrustumPlanes(DirectX::FXMMATRIX viewProj, DirectX::XMFLOAT4 outPlanes[6])
 {
-    outVisibleIndices.clear();
-
     DirectX::XMFLOAT4X4 m;
     DirectX::XMStoreFloat4x4(&m, viewProj);
 
@@ -124,25 +120,34 @@ void CullInstancesByFrustum(const std::vector<InstanceData>& instances,
     //   左平面条件 clip.x >= -clip.w  =>  (col0 + col3) · v >= 0
     // 其余平面同理。D3D 的 NDC 是 x,y ∈ [-1,1]、z ∈ [0,1]，
     // 所以近平面直接用 col2（z >= 0），远平面是 col3 - col2（z <= w）。
+    //
+    // 注意 D3D 与 OpenGL 的差异：OpenGL 的 NDC z ∈ [-1,1]，
+    // 近平面会变成 col2 + col3。搞错这一条会让近平面判断完全失效。
     const DirectX::XMFLOAT4 col0 = { m.m[0][0], m.m[1][0], m.m[2][0], m.m[3][0] };
     const DirectX::XMFLOAT4 col1 = { m.m[0][1], m.m[1][1], m.m[2][1], m.m[3][1] };
     const DirectX::XMFLOAT4 col2 = { m.m[0][2], m.m[1][2], m.m[2][2], m.m[3][2] };
     const DirectX::XMFLOAT4 col3 = { m.m[0][3], m.m[1][3], m.m[2][3], m.m[3][3] };
 
-    DirectX::XMFLOAT4 planes[6];
-    planes[0] = { col0.x + col3.x, col0.y + col3.y, col0.z + col3.z, col0.w + col3.w }; // left
-    planes[1] = { col3.x - col0.x, col3.y - col0.y, col3.z - col0.z, col3.w - col0.w }; // right
-    planes[2] = { col1.x + col3.x, col1.y + col3.y, col1.z + col3.z, col1.w + col3.w }; // bottom
-    planes[3] = { col3.x - col1.x, col3.y - col1.y, col3.z - col1.z, col3.w - col1.w }; // top
-    planes[4] = col2;                                                                   // near
-    planes[5] = { col3.x - col2.x, col3.y - col2.y, col3.z - col2.z, col3.w - col2.w }; // far
+    outPlanes[0] = { col0.x + col3.x, col0.y + col3.y, col0.z + col3.z, col0.w + col3.w }; // left
+    outPlanes[1] = { col3.x - col0.x, col3.y - col0.y, col3.z - col0.z, col3.w - col0.w }; // right
+    outPlanes[2] = { col1.x + col3.x, col1.y + col3.y, col1.z + col3.z, col1.w + col3.w }; // bottom
+    outPlanes[3] = { col3.x - col1.x, col3.y - col1.y, col3.z - col1.z, col3.w - col1.w }; // top
+    outPlanes[4] = col2;                                                                  // near
+    outPlanes[5] = { col3.x - col2.x, col3.y - col2.y, col3.z - col2.z, col3.w - col2.w }; // far
 
-    for (DirectX::XMFLOAT4& plane : planes)
+    for (std::uint32_t i = 0; i < 6; ++i)
     {
-        NormalizePlane(plane);
+        NormalizePlane(outPlanes[i]);
     }
+}
 
+void CullInstancesByFrustumWithPlanes(const std::vector<InstanceData>& instances,
+                                      const DirectX::XMFLOAT4 planes[6],
+                                      std::vector<std::uint32_t>& outVisibleIndices)
+{
+    outVisibleIndices.clear();
     outVisibleIndices.reserve(instances.size());
+
     for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(instances.size()); ++i)
     {
         const DirectX::XMFLOAT4& sphere = instances[i].boundingSphere;
@@ -150,9 +155,13 @@ void CullInstancesByFrustum(const std::vector<InstanceData>& instances,
 
         // 保守测试：只有当球**完全**落在某个平面外侧时才判定不可见。
         // 这样不会误剔除，代价是可能保留少量实际不可见的实例 —— 对剔除来说是正确的取舍。
+        //
+        // 这里的算术写法刻意与 FrustumCullingCS.hlsl 保持一致
+        // （逐个乘加，而不是 dot()），让两侧尽可能生成相同的浮点运算序列。
         bool visible = true;
-        for (const DirectX::XMFLOAT4& plane : planes)
+        for (std::uint32_t planeIndex = 0; planeIndex < 6; ++planeIndex)
         {
+            const DirectX::XMFLOAT4& plane = planes[planeIndex];
             const float distance =
                 plane.x * sphere.x + plane.y * sphere.y + plane.z * sphere.z + plane.w;
             if (distance < -radius)
@@ -167,4 +176,13 @@ void CullInstancesByFrustum(const std::vector<InstanceData>& instances,
             outVisibleIndices.push_back(i);
         }
     }
+}
+
+void CullInstancesByFrustum(const std::vector<InstanceData>& instances,
+                            DirectX::FXMMATRIX viewProj,
+                            std::vector<std::uint32_t>& outVisibleIndices)
+{
+    DirectX::XMFLOAT4 planes[6];
+    ExtractFrustumPlanes(viewProj, planes);
+    CullInstancesByFrustumWithPlanes(instances, planes, outVisibleIndices);
 }

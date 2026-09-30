@@ -12,6 +12,11 @@
 #include "Render/DebugLines.h"
 #include "Render/DebugText.h"
 #include "Render/GPUBuffer.h"
+#include "Render/GPUFrustumCuller.h"
+#include "Render/IndirectDrawCommands.h"
+#include "Render/InstanceBuffer.h"
+#include "Render/InstanceValidator.h"
+#include "Render/VisibleInstanceList.h"
 #include "Render/Material.h"
 #include "Render/Mesh.h"
 #include "Render/Texture.h"
@@ -36,6 +41,21 @@ struct InstanceConstants
     DirectX::XMFLOAT4 lightDirection;
 };
 
+// GPU-Driven 路径的**全局**常量（每帧一份，而不是每实例一份）。
+//
+// 为什么需要它：GPU-Driven 下实例的 world 矩阵来自常驻显存的 StructuredBuffer，
+// 但 viewProj 与光照方向是「全场共用」的 —— 它们不适合放在实例缓冲里（会重复 N 份），
+// 也不再有每实例的 ObjectConstants 可以读。所以单独开一份每帧常量。
+//
+// 内存布局（与 shaders/MeshGPUDrivenVS.hlsl / PS.hlsl 的 GlobalConstants 对应）：
+//   offset  0 : viewProj       float4x4 -> 世界 -> 裁剪
+//   offset 64 : lightDirection float4   -> 世界空间光照方向
+struct GlobalConstants
+{
+    DirectX::XMFLOAT4X4 viewProj;
+    DirectX::XMFLOAT4 lightDirection;
+};
+
 // 一帧的 CPU 侧统计量。M7 建立了 baseline，M8 把「剔除」单独拆出来计量，
 // 以便量化 CPU 剔除本身的开销与它带来的提交量下降。
 struct FrameStats
@@ -50,6 +70,12 @@ struct FrameStats
     std::uint32_t visibleInstances = 0;   // 通过 CPU 视锥测试的实例数
     std::uint32_t culledInstances = 0;    // 被剔除的实例数 = total - visible
     std::uint32_t submittedDrawCalls = 0; // 本帧提交的 draw call 数
+
+    // M12：GPU-Driven 模式下 CPU 提交的是「1 次 ExecuteIndirect」，
+    // 真正的命令条数由 GPU 的计数器决定 —— 这两个量刻意分开统计，
+    // 因为「CPU 提交了几次」正是本里程碑要压缩的对象。
+    std::uint32_t indirectExecuteCount = 0; // CPU 侧 ExecuteIndirect 调用次数（0 或 1）
+    bool gpuDriven = false;                 // 本帧用的是哪条渲染路径
 };
 
 // 每帧独立的资源与同步状态。
@@ -80,17 +106,41 @@ class Renderer
 {
 public:
     static constexpr UINT kFrameCount = 3;         // 三重缓冲
-    static constexpr UINT kMaxTextures = 16;       // SRV 描述符堆容量
+    static constexpr UINT kMaxTextures = 16;       // CBV/SRV/UAV 描述符堆容量
+
+    // 描述符堆里的槽位分配（CBV_SRV_UAV 是同一种堆类型，SRV 与 UAV 混排）
+    //
+    // 约束：放进**同一张描述符表**的描述符必须在堆里连续
+    // （表只指向第一项，硬件按 Range 数量往后取）。下面用注释标出各张表。
+    static constexpr UINT kStressTextureSrvSlot = 0;      // 材质纹理          [CPU-Driven 表 / GPU-Driven 材质表]
+    static constexpr UINT kFontAtlasSrvSlot = 1;          // 屏幕文本字体图集  [UI 表]
+    static constexpr UINT kInstanceSrvSlot = 2;           // StructuredBuffer<InstanceData>（M9）[GPU-Driven 实例表]
+    static constexpr UINT kVisibleIndicesSrvSlot = 3;     // 可见索引列表 SRV（M12）  [命令生成表: 3,4]
+    static constexpr UINT kVisibleCountSrvSlot = 4;       // 可见计数器 SRV（M12）    [命令生成表: 3,4]
+    static constexpr UINT kValidationResultsUavSlot = 5;  // 验证：每实例错误码        [验证表: 5,6]
+    static constexpr UINT kValidationDumpUavSlot = 6;     // 验证：原始字节 dump       [验证表: 5,6]
+    static constexpr UINT kVisibilityUavSlot = 7;         // 可见索引 UAV（M11）       [剔除表: 7,8]
+    static constexpr UINT kVisibleCountUavSlot = 8;       // 可见计数 UAV（M11）       [剔除表: 7,8]
+    static constexpr UINT kIndirectArgsUavSlot = 9;       // 间接命令参数 UAV（M12）
+
+    // 渲染模式：CPU 逐实例提交 vs GPU-Driven ExecuteIndirect
+    enum class RenderMode
+    {
+        CpuDriven, // CPU 对每个可见实例发一次 SetCBV + DrawIndexedInstanced
+        GpuDriven, // CPU 只发一次 ExecuteIndirect；命令数量由 GPU 的计数器决定
+    };
     static constexpr UINT kMaxInstances = 100000;  // 常量缓冲按此规模预分配
     static constexpr UINT kConstantStride = 256;   // 每个实例的常量槽位（CBV 256 字节对齐）
     static constexpr UINT kUiConstantSlot = kMaxInstances;        // UI 正交投影常量
-    static constexpr UINT kDebugConstantSlot = kMaxInstances + 1; // 调试线框（复用场景 viewProj）
+    static constexpr UINT kDebugConstantSlot = kMaxInstances + 1;  // 调试线框（复用场景 viewProj）
+    static constexpr UINT kGlobalConstantSlot = kMaxInstances + 2; // M12：GPU-Driven 的每帧全局常量
 
     // 启动配置全部来自命令行；运行中可用按键改变（1/2/3 规模、C 剔除、V 可视化、方向键转视角）。
     bool Initialize(ID3D12Device* device, IDXGIFactory4* factory, HWND hwnd,
                     UINT width, UINT height, std::uint32_t initialInstanceCount = 1000,
                     bool useCpuCulling = true, float cameraYawDegrees = 0.0f,
-                    int debugViewMode = 0);
+                    int debugViewMode = 0, bool compareCullingAtStartup = false,
+                    bool gpuDriven = false);
     void Shutdown();
     void Render();
 
@@ -135,6 +185,19 @@ private:
 
     // 把统计文本写进 DebugText（每帧调用）
     void BuildStatisticsText();
+
+    // ---- M9：GPU 常驻实例数据 ----
+    // 把场景的全部 InstanceData 上传到 DEFAULT Heap 的 StructuredBuffer。
+    // 走一次性的「临时命令列表 -> 提交 -> 等待」流程（场景切换时调用）。
+    bool UploadInstanceData();
+
+    // 在 GPU 上跑验证 CS 并把结果读回来比对（阻塞，仅按需调用）。
+    void RunInstanceValidation();
+
+    // ---- M10：GPU 视锥剔除 ----
+    // 按 G 键触发：把 GPU 的 visibility buffer 读回来与 CPU 剔除结果逐实例对比。
+    // （阻塞，仅按需调用；每帧的 dispatch 不需要回读。）
+    void CompareGpuAndCpuCulling();
 
     // 用球坐标更新相机（yaw / pitch / distance）。
     // 之所以用球坐标而不是直接存 eye：绕场景中心旋转只需改一个角度，
@@ -186,6 +249,46 @@ private:
     // 场景与可见性
     Scene m_scene;
     std::vector<std::uint32_t> m_visibleIndices; // 复用容器，避免每帧分配
+
+    // ---- M9：GPU 常驻实例数据 ----
+    // InstanceBuffer 把整个场景的 InstanceData 放在**显存**里，
+    // 供后续里程碑的 Compute Shader 剔除 / 间接绘制读取。
+    // M9 中主渲染路径仍然是 CPU-Driven（每个实例一次 SetCBV + Draw），
+    // 这个缓冲只是「把数据准备好并验证正确」。
+    InstanceBuffer m_instanceBuffer;
+    InstanceValidator m_instanceValidator;
+    ComPtr<ID3D12Device> m_device;      // 保存下来给场景切换时的重上传用
+    bool m_validationRequested = false; // 按 T 键置位，在下一帧安全点执行
+
+    // ---- M10/M11：GPU 视锥剔除 + Stream Compaction ----
+    // VisibleInstanceList 保存**压缩后**的可见实例 ID 列表与其计数器。
+    // 本阶段仍然**不消费**这份结果（渲染仍是 CPU-Driven，
+    // ExecuteIndirect 属于下一个里程碑），它用于与 CPU 结果对比验证。
+    VisibleInstanceList m_visibleList;
+    GPUFrustumCuller m_frustumCuller;
+    bool m_cullComparisonRequested = false; // 按 G 键置位
+    bool m_compareCullingAtStartup = false; // --compare-cull：等到若干帧后再对比
+    UINT m_frameCounter = 0;                // 已渲染帧数（用于延迟触发对比）
+    // 上一帧剔除用的视锥平面（已归一化），供回读对比时 CPU 侧复用同一份数据
+    DirectX::XMFLOAT4 m_lastFrustumPlanes[6] = {};
+
+    // ---- M12：GPU-Driven Rendering（ExecuteIndirect）----
+    // IndirectDrawCommands 持有间接参数缓冲、命令签名与命令生成 Compute Pass。
+    IndirectDrawCommands m_indirectCommands;
+    RenderMode m_renderMode = RenderMode::CpuDriven;
+
+    // 全局常量（每帧一份，而不是每实例一份）：GPU-Driven 的 VS/PS 需要
+    // viewProj 与光照方向，但不再有每实例的 ObjectConstants 可读。
+    ComPtr<ID3D12RootSignature> m_gpuDrivenRootSignature;
+    ComPtr<ID3D12PipelineState> m_gpuDrivenPipelineState;
+    bool CreateGpuDrivenRootSignature(ID3D12Device* device);
+    bool CreateGpuDrivenPipelineState(ID3D12Device* device);
+
+    // 用 GPU-Driven 路径记录绘制（一次 ExecuteIndirect 提交全部可见实例）。
+    // 用 GPU-Driven 路径记录绘制（一次 ExecuteIndirect 提交全部可见实例）。
+    // visibleCount 是本帧 CPU 侧的可见数，只用作 MaxCommandCount 的**上限**；
+    // 真正的条数由 GPU 的计数器决定（见实现里的两种取法）。
+    void RecordGpuDrivenDraw(UINT indexCount, std::uint32_t visibleCount);
 
     // ---- M8：CPU 视锥剔除 ----
     // 默认开启（M8 的主题就是只提交可见实例）；按 C 可切回「提交全部」，

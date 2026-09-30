@@ -15,7 +15,9 @@ public:
     bool Initialize(std::uint32_t initialInstanceCount = 1000,
                     bool useCpuCulling = true,
                     float cameraYawDegrees = 0.0f,
-                    int debugViewMode = 0);
+                    int debugViewMode = 0,
+                    bool compareCulling = false,
+                    bool gpuDriven = false);
     void Run();
     void Shutdown();
 

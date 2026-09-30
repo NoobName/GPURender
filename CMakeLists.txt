@@ -28,6 +28,11 @@ add_executable(GPUDrivenRenderer
     src/Render/Texture.cpp
     src/Render/DebugText.cpp
     src/Render/DebugLines.cpp
+    src/Render/InstanceBuffer.cpp
+    src/Render/InstanceValidator.cpp
+    src/Render/VisibleInstanceList.cpp
+    src/Render/GPUFrustumCuller.cpp
+    src/Render/IndirectDrawCommands.cpp
     src/Asset/ObjLoader.cpp
     src/Asset/TgaLoader.cpp
     src/Scene/Scene.cpp

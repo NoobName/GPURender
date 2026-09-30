@@ -1,4 +1,4 @@
-﻿#include "Render/Renderer.h"
+#include "Render/Renderer.h"
 
 #include "Asset/ObjLoader.h"
 #include "Asset/TgaLoader.h"
@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -19,6 +20,18 @@ using namespace DirectX;
 
 namespace
 {
+// CPU/GPU 路径必须使用相同的光栅化规则，才能公平比较提交方式。
+// 保持基线的双面渲染；近距离或从模型内部观察时，背面也参与遮挡。
+D3D12_RASTERIZER_DESC MeshRasterizerState()
+{
+    D3D12_RASTERIZER_DESC desc = {};
+    desc.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.CullMode = D3D12_CULL_MODE_NONE;
+    desc.FrontCounterClockwise = FALSE;
+    desc.DepthClipEnable = TRUE;
+    return desc;
+}
+
 // D3D12 常量缓冲（CBV）绑定要求起始地址按 256 字节对齐，
 // 所以每个对象的常量数据都按 256 字节占一个槽位。
 constexpr UINT Align256(UINT size)
@@ -65,11 +78,14 @@ std::string GetExecutableDirectory()
 
 bool Renderer::Initialize(ID3D12Device* device, IDXGIFactory4* factory, HWND hwnd,
                           UINT width, UINT height, std::uint32_t initialInstanceCount,
-                          bool useCpuCulling, float cameraYawDegrees, int debugViewMode)
+                          bool useCpuCulling, float cameraYawDegrees, int debugViewMode,
+                          bool compareCullingAtStartup, bool gpuDriven)
 {
     m_cpuCullingEnabled = useCpuCulling;
     m_cameraYawDegrees = cameraYawDegrees;
     m_debugViewMode = debugViewMode;
+    m_renderMode = gpuDriven ? RenderMode::GpuDriven : RenderMode::CpuDriven;
+    m_device = device; // 场景切换时需要重新上传实例数据
 
     m_hwnd = hwnd;
     m_width = width;
@@ -95,25 +111,39 @@ bool Renderer::Initialize(ID3D12Device* device, IDXGIFactory4* factory, HWND hwn
     if (!CreatePipelineState(device)) return false;      // 网格 PSO
     if (!CreateUiPipelineState(device)) return false;    // UI 叠加 PSO
     if (!CreateDebugPipelineState(device)) return false; // 调试线框 PSO
+
+    if (!CreateGpuDrivenRootSignature(device)) return false;
+
+    if (!CreateGpuDrivenPipelineState(device)) return false;
+
     if (!CreateDepthBuffer(device)) return false;
     if (!CreateConstantBuffers(device)) return false;
-    if (!CreateAssets(device)) return false;
-    if (!m_debugLines.Initialize(device)) return false;
 
-    // 相机用球坐标 (yaw, pitch, distance) 描述，绕场景中心旋转。
-    //
-    // 默认值与 M7 的固定视角完全一致（距离 49、俯仰 11.8°、yaw 0 ⇒ (0, 10, -48)），
-    // 因此 M7 采集的 benchmark 数据在 M8 依然可比。
-    //
-    // 相机刻意放在**场景球体内部**（场景半径 55）：身后与视锥外的大量实例
-    // 会被真正剔除，Visible Count 才有意义；若把相机远远放在球外，
-    // 整个场景都落在视锥里，可见率恒为 100%，剔除就无从验证。
+
+    // 相机：位置固定在场景内部（场景半径 55）。
+    // 身后与视锥外的大量实例会被真正剔除，Visible Count 才有意义；
+    // 若把相机远远放在球外，整个场景都落在视锥里，可见率恒为 100%。
     m_camera.SetPerspective(60.0f, static_cast<float>(m_width) / static_cast<float>(m_height),
                             0.5f, 500.0f);
     UpdateCamera(0.0);
 
-    // 初始场景规模来自命令行（默认 1000），运行中按 1 / 2 / 3 可切换
+    // 初始场景规模来自命令行（默认 1000），运行中按 1 / 2 / 3 可切换。
+    // **顺序很重要**：必须先完成 CPU 侧场景生成，CreateAssets 才能把
+    // 实例数据一并上传到 GPU（M9）。
     RegenerateScene(initialInstanceCount);
+
+    if (!CreateAssets(device)) return false;
+    if (!m_debugLines.Initialize(device)) return false;
+
+    // M9：上传完成后立刻验证一次，确认 C++ / HLSL 的布局约定一致。
+    RunInstanceValidation();
+
+    // M10：--compare-cull 时，把「GPU vs CPU 剔除」的对比排到稍后的一帧。
+    // 必须先有一帧算出 CPU 结果与视锥平面，对比才有参照；
+    // 而 GPU 侧的压缩结果同样来自**已经执行完**的帧 —— 所以这里再等几帧，
+    // 避免在「GPU 还没来得及写」时就读回（那会读到全 0）。
+    m_cullComparisonRequested = false;
+    m_compareCullingAtStartup = compareCullingAtStartup;
 
     return true;
 }
@@ -152,6 +182,24 @@ void Renderer::Render()
     // 1. 等待当前 frame 上一轮的 GPU 工作完成（可安全复用其 allocator 与常量缓冲）。
     WaitForGpu();
 
+    // M10：按 G 键请求的 GPU/CPU 剔除结果对比，在 WaitForGpu 之后执行。
+    // 注意真正的对比放在**本帧 CPU 剔除完成之后**（见下面），
+    // 这样两侧用的才是同一帧、同一份视锥平面。
+    if (m_validationRequested)
+    {
+        m_validationRequested = false;
+        RunInstanceValidation();
+    }
+
+    // --compare-cull 延迟到第 60 帧：必须等 GPU 真正执行过命令生成与压缩，
+    // 读回才有意义（第一帧读回只会得到缓冲区初值 0）。
+    if (m_compareCullingAtStartup && m_frameCounter >= 60u)
+    {
+        m_compareCullingAtStartup = false;
+        m_cullComparisonRequested = true;
+    }
+    ++m_frameCounter;
+
     const UINT backBufferIndex = m_swapChain->GetCurrentBackBufferIndex();
     FrameContext& frame = m_frames[m_frameIndex];
 
@@ -172,14 +220,32 @@ void Renderer::Render()
 
     // 3. CPU 视锥剔除：提取 6 个裁剪平面，逐个测试实例的世界空间包围球。
     //    这是 M8 的主题，因此**单独计时**，用来量化「剔除本身的成本」。
+    //
+    //    M10 起，平面被单独提取出来保存：GPU 剔除（FrustumCullingCS）会用
+    //    **完全相同的一份平面**，这样「GPU vs CPU 的可见集是否一致」
+    //    才是一个纯粹的浮点运算对比，而不掺杂平面提取方式的差异。
     const std::vector<InstanceData>& instances = m_scene.GetInstances();
     LARGE_INTEGER counterCullBegin = {};
     QueryPerformanceCounter(&counterCullBegin);
-    CullInstancesByFrustum(instances, viewProj, m_visibleIndices);
+    ExtractFrustumPlanes(viewProj, m_lastFrustumPlanes);
+    CullInstancesByFrustumWithPlanes(instances, m_lastFrustumPlanes, m_visibleIndices);
     QueryPerformanceCounter(&counterCullEnd);
 
     const std::uint32_t totalCount = static_cast<std::uint32_t>(instances.size());
     const std::uint32_t visibleCount = static_cast<std::uint32_t>(m_visibleIndices.size());
+
+    // 3b. M10：按 G 键时，用**刚算出的这一份平面**重跑一次 GPU 剔除并读回对比。
+    //
+    //     为什么要在对比里重新 dispatch，而不是复用主命令列表里那份：
+    //     主命令列表的 dispatch 要到本帧稍后才执行，而读回需要一个
+    //     「dispatch -> UAV barrier -> copy -> 等待」的完整闭环。
+    //     在这里用独立命令列表重跑一次，可以保证两侧输入完全相同
+    //     （同一帧、同一份归一化平面），对比结论才严格成立。
+    if (m_cullComparisonRequested && totalCount > 0)
+    {
+        m_cullComparisonRequested = false;
+        CompareGpuAndCpuCulling();
+    }
 
     // 关闭剔除时提交全部实例 —— 用来对比「剔除省下的提交成本」与「剔除本身的成本」。
     const std::uint32_t submitCount = m_cpuCullingEnabled ? visibleCount : totalCount;
@@ -231,6 +297,18 @@ void Renderer::Render()
                     &debugConstants, sizeof(debugConstants));
     }
 
+    // M12：GPU-Driven 路径的**全局**常量（每帧一份）。
+    // 它替代了「每实例一份 ObjectConstants」—— 实例的 world 矩阵改从
+    // 常驻显存的 StructuredBuffer 读取，只有全场共用的 viewProj 与
+    // 光照方向还需要每帧上传一次。
+    {
+        GlobalConstants globalConstants = {};
+        XMStoreFloat4x4(&globalConstants.viewProj, viewProj);
+        globalConstants.lightDirection = lightDirection;
+        std::memcpy(constantBase + static_cast<std::size_t>(kGlobalConstantSlot) * kConstantStride,
+                    &globalConstants, sizeof(globalConstants));
+    }
+
     frame.constantBuffer.Unmap(0, nullptr);
 
     // 6. 生成调试线框与统计文本的顶点，并上传到 GPU（属于 CPU 侧的 update 阶段）。
@@ -277,41 +355,93 @@ void Renderer::Render()
 
     // 10. 设置管线状态。根签名 / 描述符堆整帧只设一次 ——
     //     这正是要凸显的结构：昂贵的状态放循环外，廉价的绑定放循环内。
-    m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
-    m_commandList->SetPipelineState(m_pipelineState.Get());
-
+    //
+    //     M10 在图形管线之前插入了一个 Compute Pass（GPU 视锥剔除）。
+    //     顺序上必须注意：compute 与 graphics 各自有自己的根签名/PSO 绑定，
+    //     所以下面重新 SetGraphicsRootSignature + SetPipelineState 是必要的 ——
+    //     不能假设图形状态还留在上一帧的设置上。
     ID3D12DescriptorHeap* const descriptorHeaps[] = { m_srvHeap.Get() };
     m_commandList->SetDescriptorHeaps(1, descriptorHeaps);
 
-    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // 10a. GPU 视锥剔除 + Stream Compaction：每线程一个实例，
+    //      结果写进「压缩后的可见索引列表 + 计数器」。
+    //      Dispatch 的线程组数 = ceil(instanceCount / 64)，见 GPUFrustumCuller。
+    if (totalCount > 0)
+    {
+        m_frustumCuller.Record(m_commandList.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
+                               kInstanceSrvSlot, m_visibleList,
+                               m_lastFrustumPlanes, totalCount);
+    }
 
-    // 11. **baseline 的核心**：每个实例一次 SetGraphicsRootConstantBufferView + 一次 Draw。
-    //     这里刻意没有任何剔除、批处理或间接绘制 —— 就是要如实测出「朴素 CPU 提交」有多贵。
+    // 10b. GPU 命令生成：为每个可见实例生成一条 DrawIndexed 间接命令。
+    //
+    //      它读 10a 产出的压缩列表与计数器，写 indirect argument buffer。
+    //      **线程组数按容量上限取整**，实际写多少条由 GPU 内部的可见数决定 ——
+    //      这是 GPU-Driven 的核心特征：CPU 不知道也不需要知道命令条数。
+    if (totalCount > 0)
+    {
+        m_indirectCommands.Record(m_commandList.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
+                                  m_visibleList,
+                                  m_stressMesh.GetIndexCount());
+    }
+
+    // 10c. 切到图形管线。两条路径各自的绑定完全不同，所以这里是分支点：
+    //
+    //      CPU-Driven：主根签名 + 网格 PSO，逐个实例 SetCBV + Draw（第 11 步的循环）
+    //      GPU-Driven：独立的根签名 + PSO，然后**一次** ExecuteIndirect
     const D3D12_VERTEX_BUFFER_VIEW& vertexBufferView = m_stressMesh.GetVertexBufferView();
     const D3D12_INDEX_BUFFER_VIEW& indexBufferView = m_stressMesh.GetIndexBufferView();
-    m_commandList->IASetVertexBuffers(0, 1, &vertexBufferView);
-    m_commandList->IASetIndexBuffer(&indexBufferView);
-
-    D3D12_GPU_DESCRIPTOR_HANDLE materialSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
-    materialSrv.ptr += static_cast<UINT64>(m_stressMaterial.srvIndex) * m_srvDescriptorSize;
-    m_commandList->SetGraphicsRootDescriptorTable(1, materialSrv);
-
     const UINT indexCount = m_stressMesh.GetIndexCount();
-    const D3D12_GPU_VIRTUAL_ADDRESS constantBaseAddress = frame.constantBuffer.GetGPUVirtualAddress();
 
-    for (std::uint32_t i = 0; i < submitCount; ++i)
+    if (m_renderMode == RenderMode::GpuDriven)
     {
-        m_commandList->SetGraphicsRootConstantBufferView(
-            0, constantBaseAddress + static_cast<UINT64>(i) * kConstantStride);
-        m_commandList->DrawIndexedInstanced(indexCount, 1, 0, 0, 0);
+        m_stats.gpuDriven = true;
+        m_stats.submittedDrawCalls = 0;    // CPU 侧一次 draw 都没有提交
+        m_stats.indirectExecuteCount = 1;  // 只有一次 ExecuteIndirect
+
+        RecordGpuDrivenDraw(indexCount, submitCount);
+    }
+    else
+    {
+        m_stats.gpuDriven = false;
+        m_stats.submittedDrawCalls = submitCount;
+        m_stats.indirectExecuteCount = 0;
+
+        m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+        m_commandList->SetPipelineState(m_pipelineState.Get());
+
+        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        m_commandList->IASetVertexBuffers(0, 1, &vertexBufferView);
+        m_commandList->IASetIndexBuffer(&indexBufferView);
+
+        D3D12_GPU_DESCRIPTOR_HANDLE materialSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+        materialSrv.ptr += static_cast<UINT64>(m_stressMaterial.srvIndex) * m_srvDescriptorSize;
+        m_commandList->SetGraphicsRootDescriptorTable(1, materialSrv);
+
+        const D3D12_GPU_VIRTUAL_ADDRESS constantBaseAddress =
+            frame.constantBuffer.GetGPUVirtualAddress();
+
+        // **baseline 的核心**：每个实例一次 SetGraphicsRootConstantBufferView + 一次 Draw。
+        for (std::uint32_t i = 0; i < submitCount; ++i)
+        {
+            m_commandList->SetGraphicsRootConstantBufferView(
+                0, constantBaseAddress + static_cast<UINT64>(i) * kConstantStride);
+            m_commandList->DrawIndexedInstanced(indexCount, 1, 0, 0, 0);
+        }
     }
 
     // 12. 调试线框（视锥 / 包围球）：换 PSO（LINELIST 拓扑、关闭深度测试），其余状态复用。
+    //
+    //     注意它用的是**主根签名**，所以 GPU-Driven 模式下必须先切回来 ——
+    //     否则管线状态与当前根签名不匹配（Debug Layer 会直接报错）。
     if (m_debugLines.HasContent())
     {
+        m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
         m_commandList->SetPipelineState(m_debugPipelineState.Get());
         m_commandList->SetGraphicsRootConstantBufferView(
-            0, constantBaseAddress + static_cast<UINT64>(kDebugConstantSlot) * kConstantStride);
+            0, frame.constantBuffer.GetGPUVirtualAddress() +
+                   static_cast<UINT64>(kDebugConstantSlot) * kConstantStride);
         m_debugLines.Render(m_commandList.Get());
 
         // Render() 把拓扑改成了 LINELIST，后面 UI 用的是三角形，必须改回来
@@ -321,6 +451,7 @@ void Renderer::Render()
     // 13. UI 叠加：切换 PSO（alpha 混合、关闭深度），其余状态复用。
     if (m_debugText.HasContent())
     {
+        m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
         m_commandList->SetPipelineState(m_uiPipelineState.Get());
 
         D3D12_GPU_DESCRIPTOR_HANDLE fontSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
@@ -328,7 +459,8 @@ void Renderer::Render()
         m_commandList->SetGraphicsRootDescriptorTable(1, fontSrv);
 
         m_commandList->SetGraphicsRootConstantBufferView(
-            0, constantBaseAddress + static_cast<UINT64>(kUiConstantSlot) * kConstantStride);
+            0, frame.constantBuffer.GetGPUVirtualAddress() +
+                   static_cast<UINT64>(kUiConstantSlot) * kConstantStride);
         m_debugText.Render(m_commandList.Get());
     }
 
@@ -364,7 +496,9 @@ void Renderer::Render()
     m_stats.recordMs = static_cast<double>(counter2.QuadPart - counter1.QuadPart) * toMilliseconds;
     m_stats.presentMs = static_cast<double>(counter3.QuadPart - counter2.QuadPart) * toMilliseconds;
     m_stats.cpuFrameMs = static_cast<double>(counter3.QuadPart - counter0.QuadPart) * toMilliseconds;
-    m_stats.submittedDrawCalls = submitCount;
+    // 注意 submittedDrawCalls 与 indirectExecuteCount 在**记录命令时**
+    // 已经按当前渲染模式设好了（见第 10c 步的分支），这里不能覆盖 ——
+    // 否则 GPU-Driven 模式下会把「CPU 实际一次都没提交」误报成 N 次。
     m_stats.totalInstances = totalCount;
     m_stats.visibleInstances = visibleCount;
     m_stats.culledInstances = totalCount - visibleCount;
@@ -383,7 +517,9 @@ void Renderer::Render()
         std::cout << "[Bench] instances=" << m_stats.totalInstances
                   << " visible=" << m_stats.visibleInstances
                   << " culled=" << m_stats.culledInstances
-                  << " draws=" << m_stats.submittedDrawCalls
+                  << " mode=" << (m_stats.gpuDriven ? "gpu" : "cpu")
+                  << " cpuDraws=" << m_stats.submittedDrawCalls
+                  << " execIndirect=" << m_stats.indirectExecuteCount
                   << " culling=" << (m_cpuCullingEnabled ? "on" : "off")
                   << " cpuFrame=" << m_avgCpuFrameMs << "ms"
                   << " cull=" << m_avgCullMs << "ms"
@@ -637,11 +773,7 @@ bool Renderer::CreatePipelineState(ID3D12Device* device)
     desc.BlendState.RenderTarget[0].BlendEnable = FALSE;
     desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     desc.SampleMask = UINT_MAX;
-    // Rasterizer：实心填充，不剔除背面（M5 简化，深度测试保证正确遮挡）
-    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    desc.RasterizerState.FrontCounterClockwise = FALSE;
-    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.RasterizerState = MeshRasterizerState();
     // 深度模板：开启深度测试（写入全部、比较 LESS）
     desc.DepthStencilState.DepthEnable = TRUE;
     desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
@@ -751,9 +883,15 @@ bool Renderer::CreateConstantBuffers(ID3D12Device* device)
     // 为什么按最大值预分配而不随规模重建：100000 * 256 B ≈ 24.4 MB/帧、三帧约 73 MB，
     // 现代机器完全可以接受；换来的是运行时切 1k / 10k / 100k 时零重建、零卡顿，
     // 测量结果也更干净（不会把资源创建时间混进去）。
-    // 槽位：0..kMaxInstances-1 = 实例，kUiConstantSlot = UI，kDebugConstantSlot = 调试线框
+    // 槽位：0..kMaxInstances-1 = 实例，kUiConstantSlot = UI，
+    //       kDebugConstantSlot = 调试线框，kGlobalConstantSlot = GPU-Driven 全局常量（M12）
+    //
+    // 注意这里用的是「最后一个槽位的下标 + 1」——
+    // 每加一个新的专用槽位都必须同步这个表达式，否则会出现
+    // 「槽位下标有效但缓冲装不下」的越界（表现是绑定 CBV 时直接崩溃）。
+    constexpr UINT kLastConstantSlot = kGlobalConstantSlot;
     const std::uint64_t bufferSize =
-        static_cast<std::uint64_t>(kDebugConstantSlot + 1) * kConstantStride;
+        static_cast<std::uint64_t>(kLastConstantSlot + 1) * kConstantStride;
 
     for (UINT i = 0; i < kFrameCount; ++i)
     {
@@ -796,16 +934,64 @@ bool Renderer::CreateAssets(ID3D12Device* device)
         return false;
     }
 
-    // SRV 槽位分配：0 = 实例贴图，1 = 屏幕文本用的字体图集
-    if (!LoadAndCreateTexture(device, uploadList.Get(), "assets/checker.tga", 0,
-                              m_stressTexture, stagingResources))
+    // 描述符槽位分配见 Renderer.h 的 kXxxSrvSlot 常量
+    if (!LoadAndCreateTexture(device, uploadList.Get(), "assets/checker.tga",
+                              kStressTextureSrvSlot, m_stressTexture, stagingResources))
     {
         return false;
     }
     if (!m_debugText.Initialize(device, uploadList.Get(),
                                 GetExecutableDirectory() + "assets/font_atlas.tga",
-                                m_srvHeap.Get(), m_srvDescriptorSize, 1, stagingResources))
+                                m_srvHeap.Get(), m_srvDescriptorSize,
+                                kFontAtlasSrvSlot, stagingResources))
     {
+        return false;
+    }
+
+    // ---- M9：把整个场景的实例数据放进 DEFAULT Heap 的 StructuredBuffer ----
+    //
+    // 注意必须在 uploadList->Close() 之前记录命令：这里的上传走的是同一批
+    // 「初始化期一次性上传 -> 提交 -> 等待」的流程。
+    // 场景在 Initialize 中已经先生成好了（见那里的顺序说明）。
+    if (!m_instanceBuffer.Initialize(device, uploadList.Get(), kMaxInstances,
+                                     m_scene.GetInstances(), m_srvHeap.Get(),
+                                     m_srvDescriptorSize, kInstanceSrvSlot, stagingResources))
+    {
+        std::cerr << "[Renderer] Failed to create GPU instance buffer.\n";
+        return false;
+    }
+
+    // 验证器（M9 的 Debug Validation）：创建 UAV 缓冲与 Compute PSO，
+    // 本身不上传数据，所以放在这里不影响上面的 staging 生命周期。
+    if (!m_instanceValidator.Initialize(device, kMaxInstances, m_srvHeap.Get(),
+                                        m_srvDescriptorSize,
+                                        kValidationResultsUavSlot, kValidationDumpUavSlot))
+    {
+        std::cerr << "[Renderer] Failed to create instance validator.\n";
+        return false;
+    }
+
+    // ---- M10/M11：GPU 视锥剔除 + Stream Compaction 所需的资源与 Compute PSO ----
+    // VisibleInstanceList：压缩后的可见实例 ID 列表 + 计数器（都是 DEFAULT Heap + UAV）
+    if (!m_visibleList.Initialize(device, kMaxInstances, m_srvHeap.Get(),
+                                  m_srvDescriptorSize, kVisibilityUavSlot, kVisibleCountUavSlot,
+                                  kVisibleIndicesSrvSlot, kVisibleCountSrvSlot))
+    {
+        std::cerr << "[Renderer] Failed to create visible instance list.\n";
+        return false;
+    }
+    if (!m_frustumCuller.Initialize(device, kMaxInstances))
+    {
+        std::cerr << "[Renderer] Failed to create GPU frustum culler.\n";
+        return false;
+    }
+
+    // ---- M12：GPU-Driven 渲染所需的间接命令基础设施 ----
+    if (!m_indirectCommands.Initialize(device, kMaxInstances, m_srvHeap.Get(),
+                                       m_srvDescriptorSize, kIndirectArgsUavSlot,
+                                       kVisibleIndicesSrvSlot, kVisibleCountSrvSlot))
+    {
+        std::cerr << "[Renderer] Failed to create indirect draw commands.\n";
         return false;
     }
 
@@ -828,6 +1014,11 @@ bool Renderer::CreateAssets(ID3D12Device* device)
 
     std::cout << "[Renderer] Assets loaded: stressMesh=" << (m_stressMesh.GetIndexCount() / 3)
               << " tris, srvDescriptorSize=" << m_srvDescriptorSize << "\n";
+    std::cout << "[Renderer] GPU instance buffer: " << m_instanceBuffer.GetInstanceCount()
+              << " instances x " << InstanceBuffer::GetStride() << " bytes = "
+              << (static_cast<double>(m_instanceBuffer.GetInstanceCount()) *
+                  InstanceBuffer::GetStride() / 1024.0 / 1024.0)
+              << " MB (DEFAULT heap, capacity " << m_instanceBuffer.GetCapacity() << ")\n";
     return true;
 }
 
@@ -949,6 +1140,160 @@ bool Renderer::CreateUiPipelineState(ID3D12Device* device)
     return SUCCEEDED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&m_uiPipelineState)));
 }
 
+// ---------------------------------------------------------------------------
+// M12：GPU-Driven 渲染路径的根签名与 PSO
+//
+// 这套绑定刻意与 CPU-Driven 的根签名**分开**，原因有两个：
+//   ① GPU-Driven 没有「每实例常量」这个概念，b0 的语义完全不同
+//      （全局相机常量 vs 每实例变换），塞进同一个根签名会让两边都难读；
+//   ② 分离之后 CPU-Driven 那条已经验证过的路径完全不受影响，
+//      两种模式可以并存并随时切换比较。
+//
+// 根签名布局：
+//   参数 0：CBV @ b0        全局常量（viewProj + lightDirection）   ALL
+//   参数 1：SRV 表 @ t0     实例数据 StructuredBuffer<InstanceData> ALL
+//   参数 2：SRV 表 @ t1     压缩后的可见实例索引（M11 产出）        ALL
+//   参数 3：SRV 表 @ t2     材质纹理                                PIXEL
+//   静态采样器 s0                                                   PIXEL
+//
+//   注意 t0/t1/t2 是 **shader register**，与描述符堆里的槽位无关：
+//   这三张表各自指向堆槽位 2、3、0 —— 相互独立，因此**不需要**在堆里相邻。
+// ---------------------------------------------------------------------------
+bool Renderer::CreateGpuDrivenRootSignature(ID3D12Device* device)
+{
+    D3D12_ROOT_PARAMETER params[4] = {};
+
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0; // b0
+    params[0].Descriptor.RegisterSpace = 0;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE instanceRange = {};
+    instanceRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    instanceRange.NumDescriptors = 1;
+    instanceRange.BaseShaderRegister = 0; // t0
+    instanceRange.RegisterSpace = 0;
+    instanceRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges = &instanceRange;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE visibleRange = {};
+    visibleRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    visibleRange.NumDescriptors = 1;
+    visibleRange.BaseShaderRegister = 1; // t1
+    visibleRange.RegisterSpace = 0;
+    visibleRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable.NumDescriptorRanges = 1;
+    params[2].DescriptorTable.pDescriptorRanges = &visibleRange;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE materialRange = {};
+    materialRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    materialRange.NumDescriptors = 1;
+    materialRange.BaseShaderRegister = 2; // t2
+    materialRange.RegisterSpace = 0;
+    materialRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[3].DescriptorTable.NumDescriptorRanges = 1;
+    params[3].DescriptorTable.pDescriptorRanges = &materialRange;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.RegisterSpace = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+    rootDesc.NumParameters = 4;
+    rootDesc.pParameters = params;
+    rootDesc.NumStaticSamplers = 1;
+    rootDesc.pStaticSamplers = &sampler;
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> signature;
+    ComPtr<ID3DBlob> error;
+    if (FAILED(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                           &signature, &error)))
+    {
+        std::cerr << "[Renderer] GPU-driven root signature serialize failed.\n";
+        return false;
+    }
+    if (FAILED(device->CreateRootSignature(0, signature->GetBufferPointer(),
+                                           signature->GetBufferSize(),
+                                           IID_PPV_ARGS(&m_gpuDrivenRootSignature))))
+    {
+        std::cerr << "[Renderer] GPU-driven CreateRootSignature failed.\n";
+        return false;
+    }
+    return true;
+}
+
+bool Renderer::CreateGpuDrivenPipelineState(ID3D12Device* device)
+{
+    std::string errorMsg;
+    std::vector<std::uint8_t> vsBytecode = ShaderCompiler::Compile(
+        L"MeshGPUDrivenVS.hlsl", L"main", L"vs_6_0", errorMsg);
+    if (vsBytecode.empty())
+    {
+        std::cerr << "[Renderer] GPU-driven VS compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+    std::vector<std::uint8_t> psBytecode = ShaderCompiler::Compile(
+        L"MeshGPUDrivenPS.hlsl", L"main", L"ps_6_0", errorMsg);
+    if (psBytecode.empty())
+    {
+        std::cerr << "[Renderer] GPU-driven PS compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+
+    // 输入布局与 CPU-Driven 的网格 PSO 完全一致（同一个 Mesh）
+    const D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+    desc.pRootSignature = m_gpuDrivenRootSignature.Get();
+    desc.VS = { vsBytecode.data(), vsBytecode.size() };
+    desc.PS = { psBytecode.data(), psBytecode.size() };
+
+    desc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.SampleMask = UINT_MAX;
+
+    desc.RasterizerState = MeshRasterizerState();
+
+    // 深度状态必须与 CPU-Driven 的网格 PSO 一致，否则切换模式时画面会变
+    desc.DepthStencilState.DepthEnable = TRUE;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    desc.DepthStencilState.StencilEnable = FALSE;
+
+    desc.InputLayout = { inputLayout,
+                         static_cast<UINT>(sizeof(inputLayout) / sizeof(inputLayout[0])) };
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    desc.SampleDesc.Count = 1;
+
+    return SUCCEEDED(device->CreateGraphicsPipelineState(&desc,
+                                                         IID_PPV_ARGS(&m_gpuDrivenPipelineState)));
+}
+
 void Renderer::RegenerateScene(std::uint32_t instanceCount)
 {
     // 切换规模会立刻改变提交数量与常量缓冲内容，先确保 GPU 已经读完上一批数据。
@@ -966,10 +1311,237 @@ void Renderer::RegenerateScene(std::uint32_t instanceCount)
 
     std::cout << "[Renderer] Scene generated: " << instanceCount
               << " instances (seed=0x" << std::hex << config.randomSeed << std::dec << ")\n";
+
+    // M9：把新的实例数据重新上传到 GPU。
+    // 这里只在场景规模变化时发生（初始化或按 1/2/3），不在每帧路径上。
+    if (m_instanceBuffer.GetCapacity() > 0)
+    {
+        UploadInstanceData();
+    }
 }
 
-void Renderer::HandleKey(UINT virtualKey)
+bool Renderer::UploadInstanceData()
 {
+    const std::vector<InstanceData>& instances = m_scene.GetInstances();
+    if (instances.empty())
+    {
+        return true;
+    }
+
+    // 复用初始化期那套「临时命令列表 -> 提交 -> 等待」流程：
+    // 一次性、不在热路径上，代码直白比省一点延迟更重要。
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&allocator))) ||
+        FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           allocator.Get(), nullptr, IID_PPV_ARGS(&list))))
+    {
+        std::cerr << "[Renderer] Failed to create upload list for instance data.\n";
+        return false;
+    }
+
+    std::vector<ComPtr<ID3D12Resource>> stagingResources;
+    if (!m_instanceBuffer.Upload(m_device.Get(), list.Get(), instances, stagingResources))
+    {
+        std::cerr << "[Renderer] Failed to upload instance data.\n";
+        return false;
+    }
+
+    list->Close();
+    ID3D12CommandList* const lists[] = { list.Get() };
+    m_commandQueue->ExecuteCommandLists(1, lists);
+
+    ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+    if (m_fence->GetCompletedValue() < m_fenceValue)
+    {
+        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+    stagingResources.clear();
+
+    std::cout << "[Renderer] Instance data uploaded to GPU: " << instances.size()
+              << " x " << InstanceBuffer::GetStride() << " B ("
+              << (static_cast<double>(instances.size()) * InstanceBuffer::GetStride() / 1024.0 / 1024.0)
+              << " MB)\n";
+    return true;
+}
+
+void Renderer::RunInstanceValidation()
+{
+    const std::uint32_t instanceCount = m_instanceBuffer.GetInstanceCount();
+    if (instanceCount == 0)
+    {
+        return;
+    }
+
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&allocator))) ||
+        FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           allocator.Get(), nullptr, IID_PPV_ARGS(&list))))
+    {
+        std::cerr << "[Validation] Failed to create command list.\n";
+        return;
+    }
+
+    // 验证 CS 要读 StructuredBuffer、写两个 UAV，因此这几张表必须在
+    // shader-visible 堆里，且必须先 SetDescriptorHeaps 才能解释堆内句柄。
+    ID3D12DescriptorHeap* const heaps[] = { m_srvHeap.Get() };
+    list->SetDescriptorHeaps(1, heaps);
+    m_instanceValidator.Record(list.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
+                               kInstanceSrvSlot, kValidationResultsUavSlot, instanceCount);
+
+    list->Close();
+    ID3D12CommandList* const lists[] = { list.Get() };
+    m_commandQueue->ExecuteCommandLists(1, lists);
+
+    // 必须等 GPU 真正写完 UAV 并完成 copy，才能 Map readback 缓冲。
+    ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+    if (m_fence->GetCompletedValue() < m_fenceValue)
+    {
+        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+
+    m_instanceValidator.Report(m_scene.GetInstances());
+}
+
+void Renderer::CompareGpuAndCpuCulling()
+{
+    const std::uint32_t instanceCount = m_instanceBuffer.GetInstanceCount();
+    if (instanceCount == 0)
+    {
+        return;
+    }
+
+    // ---- 用独立命令列表跑一次 GPU 剔除，然后读回 ----
+    //
+    // 这一次 dispatch 与主渲染命令列表里那份是重复的，但只有按下验证键时
+    // 才会发生，换来的是「GPU 与 CPU 使用同一帧、同一份平面」这个严格前提。
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&allocator))) ||
+        FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           allocator.Get(), nullptr, IID_PPV_ARGS(&list))))
+    {
+        std::cerr << "[Renderer] Failed to create command list for culling comparison.\n";
+        return;
+    }
+
+    ID3D12DescriptorHeap* const heaps[] = { m_srvHeap.Get() };
+    list->SetDescriptorHeaps(1, heaps);
+    m_frustumCuller.Record(list.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
+                           kInstanceSrvSlot, m_visibleList,
+                           m_lastFrustumPlanes, instanceCount);
+    list->Close();
+
+    ID3D12CommandList* const lists[] = { list.Get() };
+    m_commandQueue->ExecuteCommandLists(1, lists);
+
+    ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+    if (m_fence->GetCompletedValue() < m_fenceValue)
+    {
+        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+
+    // ---- 读回并与本帧的 CPU 可见集逐实例对比 ----
+    m_frustumCuller.ReadbackAndCompare(m_device.Get(), m_commandQueue.Get(),
+                                       m_fence.Get(), m_fenceEvent, m_fenceValue,
+                                       m_visibleList,
+                                       m_visibleIndices, instanceCount);
+
+    // 临时诊断：此刻 GPU 已经执行过若干帧，参数缓冲里应当有真实内容。
+    m_indirectCommands.DebugReadbackFirstCommands(
+        m_device.Get(), m_commandQueue.Get(), m_fence.Get(), m_fenceEvent,
+        m_fenceValue, 4);
+}
+
+void Renderer::RecordGpuDrivenDraw(UINT indexCount, std::uint32_t visibleCount)
+{
+    // visibleCount 在本版里不再参与提交 —— ExecuteIndirect 的命令条数恒为 1，
+    // 而「画多少个实例」由 GPU 写进间接命令的 InstanceCount 决定。
+    // 参数保留是为了给调用方一个明确的语义：CPU **知道**可见数，但**不用**它。
+    (void)visibleCount;
+
+    // =========================================================================
+    // GPU-Driven 的绘制记录：整段只有**一次** ExecuteIndirect，没有任何逐实例循环。
+    // =========================================================================
+    // 1. 绑定 GPU-Driven 专用的根签名与 PSO。
+    m_commandList->SetGraphicsRootSignature(m_gpuDrivenRootSignature.Get());
+    m_commandList->SetPipelineState(m_gpuDrivenPipelineState.Get());
+
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    // 2. 几何数据（顶点/索引缓冲）—— 所有实例共用同一个 Mesh（本版的简化）。
+    const D3D12_VERTEX_BUFFER_VIEW& vertexBufferView = m_stressMesh.GetVertexBufferView();
+    const D3D12_INDEX_BUFFER_VIEW& indexBufferView = m_stressMesh.GetIndexBufferView();
+    m_commandList->IASetVertexBuffers(0, 1, &vertexBufferView);
+    m_commandList->IASetIndexBuffer(&indexBufferView);
+
+    // 3. 绑定：全局常量(b0) + 实例数据(t0) + 可见索引(t1) + 材质(t2)
+    //
+    //    与 CPU-Driven 最大的不同：**没有每实例的常量绑定**。
+    //    实例的 world 矩阵由顶点着色器用 SV_InstanceID 从 StructuredBuffer 自取。
+    m_commandList->SetGraphicsRootConstantBufferView(
+        0, m_frames[m_frameIndex].constantBuffer.GetGPUVirtualAddress() +
+               static_cast<UINT64>(kGlobalConstantSlot) * kConstantStride);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE instanceSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    instanceSrv.ptr += static_cast<UINT64>(kInstanceSrvSlot) * m_srvDescriptorSize;
+    m_commandList->SetGraphicsRootDescriptorTable(1, instanceSrv);
+
+    // 压缩后的可见实例索引（M11 产出）：顶点着色器用它把 SV_InstanceID
+    // 换算成真正的实例 ID。
+    D3D12_GPU_DESCRIPTOR_HANDLE visibleSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    visibleSrv.ptr += static_cast<UINT64>(kVisibleIndicesSrvSlot) * m_srvDescriptorSize;
+    m_commandList->SetGraphicsRootDescriptorTable(2, visibleSrv);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE materialSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    materialSrv.ptr += static_cast<UINT64>(m_stressMaterial.srvIndex) * m_srvDescriptorSize;
+    m_commandList->SetGraphicsRootDescriptorTable(3, materialSrv);
+
+    // 4. **状态转换**：参数缓冲从 UNORDERED_ACCESS 转到 INDIRECT_ARGUMENT。
+    //
+    //    ExecuteIndirect 要求参数缓冲处于 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT ——
+    //    它告诉驱动这块内存接下来由**命令处理器**读取，而不是被着色器读写。
+    //    用错状态会读到陈旧的命令（驱动会认为不需要刷新相关缓存）。
+    m_indirectCommands.TransitionTo(m_commandList.Get(),
+                                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+
+    // 5. 可见索引列表在这次绘制里被**顶点着色器**读取，所以要转到
+    //    NON_PIXEL_SHADER_RESOURCE（顶点阶段属于 non-pixel）。
+    m_visibleList.TransitionIndicesTo(m_commandList.Get(),
+                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_visibleList.TransitionCountTo(m_commandList.Get(),
+                                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+
+    // 6. **一次 ExecuteIndirect 提交 1 条命令**，而这条命令的 InstanceCount
+    //    是 GPU 写进去的可见数 —— 于是「画多少个实例」完全由 GPU 决定。
+    //
+    //    MaxCommandCount = 1 是编译期常数：无论场景有多少实例、可见多少，
+    //    CPU 提交的命令条数**永远是 1**。这就是 GPU-Driven 的实质。
+    m_commandList->ExecuteIndirect(
+        m_indirectCommands.GetCommandSignature(),
+        1,                                         // 永远只有一条命令
+        m_indirectCommands.GetArgumentBuffer(), 0,
+        nullptr, 0);                               // 条数不来自 count buffer
+
+    // 7. 转回 UNORDERED_ACCESS，让下一帧的命令生成 CS 可以直接继续写。
+    m_indirectCommands.TransitionTo(m_commandList.Get(),
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+
+    (void)indexCount;
+}
+
+void Renderer::HandleKey(UINT virtualKey){
     constexpr float kRotateStep = 5.0f;
     constexpr float kMaxPitch = 85.0f;
 
@@ -1029,6 +1601,33 @@ void Renderer::HandleKey(UINT virtualKey)
         std::cout << "[Renderer] Debug view mode: " << m_debugViewMode << "\n";
         break;
 
+    // ---- M9：在 GPU 上重新验证实例数据 ----
+    // 只置位，真正的执行放在下一帧的安全点（WaitForGpu 之后），
+    // 避免与主渲染的命令列表/allocator 冲突。
+    case 'T':
+        m_validationRequested = true;
+        break;
+
+    // ---- M10：对比 GPU 与 CPU 的视锥剔除结果 ----
+    // 同样只置位，在下一帧 CPU 剔除完成后执行（那时两侧输入才是同帧同源的）。
+    case 'G':
+        m_cullComparisonRequested = true;
+        break;
+
+    // ---- M12：切换渲染路径 ----
+    // CPU-Driven：CPU 对每个可见实例发一次 SetCBV + DrawIndexedInstanced
+    // GPU-Driven：CPU 只发一次 ExecuteIndirect，命令条数由 GPU 计数决定
+    case 'M':
+        m_renderMode = (m_renderMode == RenderMode::CpuDriven)
+                           ? RenderMode::GpuDriven
+                           : RenderMode::CpuDriven;
+        std::cout << "[Renderer] Render mode: "
+                  << (m_renderMode == RenderMode::GpuDriven
+                          ? "GPU-DRIVEN (ExecuteIndirect)"
+                          : "CPU-DRIVEN (per-instance draw)")
+                  << "\n";
+        break;
+
     default:
         break;
     }
@@ -1069,6 +1668,63 @@ void Renderer::BuildStatisticsText()
 
         std::snprintf(line, sizeof(line), "Draw calls: %u", m_stats.submittedDrawCalls);
         m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        // M12：渲染路径与 GPU 侧的 draw 提交方式 —— 本里程碑最核心的一组对比数字。
+        //   CPU-Driven：CPU 逐个实例提交，draws = 可见实例数
+        //   GPU-Driven：CPU 一次 draw 都没提交，只有 1 次 ExecuteIndirect；
+        //               真正的实例数由 GPU 写进间接命令里
+        if (m_stats.gpuDriven)
+        {
+            std::snprintf(line, sizeof(line), "Mode      : GPU-DRIVEN (1 indirect cmd)");
+        }
+        else
+        {
+            std::snprintf(line, sizeof(line), "Mode      : CPU-DRIVEN (%u draws)",
+                          m_stats.submittedDrawCalls);
+        }
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        std::snprintf(line, sizeof(line), "CPU draws : %u   ExecIndirect: %u",
+                      m_stats.submittedDrawCalls, m_stats.indirectExecuteCount);
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 26.0f;
+
+        // M9：确认实例数据已经在 GPU 上（DEFAULT Heap 的 StructuredBuffer）
+        std::snprintf(line, sizeof(line), "GPU inst  : %u x %u B",
+                      m_instanceBuffer.GetInstanceCount(), InstanceBuffer::GetStride());
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        // M10/M11：GPU 视锥剔除 + Stream Compaction 的规模。
+        // 线程组数 = ceil(instanceCount / 64)，加号后面的 63 就是「向上取整」。
+        std::snprintf(line, sizeof(line), "GPU cull  : %u threads / %u groups",
+                      m_instanceBuffer.GetInstanceCount(),
+                      GPUFrustumCuller::GetGroupCount(m_instanceBuffer.GetInstanceCount()));
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        // M11：压缩列表的容量。实际有效长度由 GPU 计数器给出，
+        // 但那个值在 GPU 上，读回会造成 CPU 同步 —— 正常渲染流程里不读它。
+        std::snprintf(line, sizeof(line), "Compact   : %u idx cap / %u B counter",
+                      m_visibleList.GetCapacity(), VisibleInstanceList::GetCountStride());
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        // M11：最近一次 GPU/CPU 压缩对比结果（按 G 键才更新，因为需要回读）
+        if (m_frustumCuller.HasComparisonResult())
+        {
+            std::snprintf(line, sizeof(line), "CPU/GPU vis: %u / %u  mismatch %u",
+                          m_frustumCuller.GetLastCpuVisibleCount(),
+                          m_frustumCuller.GetLastGpuVisibleCount(),
+                          m_frustumCuller.GetLastMismatchCount());
+        }
+        else
+        {
+            std::snprintf(line, sizeof(line), "CPU/GPU vis: (press G to compare)");
+        }
+        m_debugText.AddText(x, y, 1.0f, line);
         y += 26.0f;
 
         std::snprintf(line, sizeof(line), "CPU frame : %.2f ms", m_avgCpuFrameMs);
@@ -1107,16 +1763,19 @@ void Renderer::BuildStatisticsText()
         m_debugText.AddText(x, y, 1.0f, line);
         y += 26.0f;
 
-        m_debugText.AddText(x, y, 1.0f, "[1][2][3] count   [C] culling   [V] debug viz");
+        m_debugText.AddText(x, y, 1.0f, "[1][2][3] count  [C] culling  [V] viz  [T] validate");
         y += 18.0f;
 
-        m_debugText.AddText(x, y, 1.0f, "[WASD/Arrows] rotate   [Space] orbit   [R] reset");
+        m_debugText.AddText(x, y, 1.0f, "[G] compare cull  [M] CPU/GPU mode  [V] viz  [T] validate");
+        y += 18.0f;
+
+        m_debugText.AddText(x, y, 1.0f, "[1][2][3] count   [C] culling   [Space] orbit   [R] reset");
     };
 
     // 背景条：实例场景里模型很密集，纯文字会淹没在几何细节中，
     // 铺一层半透明黑底后统计信息在任何视角下都清晰。
     m_debugText.SetColor(0.0f, 0.0f, 0.0f, 0.55f);
-    m_debugText.AddRect(4.0f, 4.0f, 508.0f, 342.0f);
+    m_debugText.AddRect(4.0f, 4.0f, 620.0f, 500.0f);
 
     // 阴影：让白色文字在浅色模型上也有边界
     m_debugText.SetColor(0.0f, 0.0f, 0.0f, 0.85f);

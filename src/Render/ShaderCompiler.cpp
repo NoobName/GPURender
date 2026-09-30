@@ -66,13 +66,74 @@ struct TemporaryFiles
 {
     std::wstring output;
     std::wstring log;
+    HANDLE logHandle = INVALID_HANDLE_VALUE;
+
+    void CloseLog()
+    {
+        if (logHandle != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(logHandle);
+            logHandle = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    void Reset()
+    {
+        CloseLog();
+        if (!output.empty()) DeleteFileW(output.c_str());
+        if (!log.empty()) DeleteFileW(log.c_str());
+        output.clear();
+        log.clear();
+    }
 
     ~TemporaryFiles()
     {
-        if (!output.empty()) DeleteFileW(output.c_str());
-        if (!log.empty()) DeleteFileW(log.c_str());
+        Reset();
+    }
+
+    bool Create(const std::wstring& directory, std::string& error)
+    {
+        Reset();
+        wchar_t path[MAX_PATH] = {};
+        if (GetTempFileNameW(directory.c_str(), L"gpr", 0, path) == 0)
+        {
+            const DWORD code = GetLastError();
+            error = WindowsError("Failed to create temporary DXIL file.", directory, code);
+            return false;
+        }
+        output = path;
+        if (GetTempFileNameW(directory.c_str(), L"gpr", 0, path) == 0)
+        {
+            const DWORD code = GetLastError();
+            error = WindowsError("Failed to create temporary DXC log file.", directory, code);
+            return false;
+        }
+        log = path;
+
+        SECURITY_ATTRIBUTES sa = {};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        logHandle = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (logHandle == INVALID_HANDLE_VALUE)
+        {
+            const DWORD code = GetLastError();
+            error = WindowsError("Failed to open temporary DXC log file.", log, code);
+            return false;
+        }
+        return true;
     }
 };
+
+std::wstring GetExecutableDirectory()
+{
+    wchar_t exePath[MAX_PATH] = {};
+    const DWORD length = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return {};
+    const std::wstring path(exePath);
+    const size_t pos = path.find_last_of(L"\\/");
+    return pos == std::wstring::npos ? std::wstring{} : path.substr(0, pos + 1);
+}
 
 } // namespace
 
@@ -95,30 +156,49 @@ std::vector<std::uint8_t> ShaderCompiler::Compile(const std::wstring& hlslFileNa
         return {};
     }
 
-    // 输出到临时目录（DXIL 字节码 + 错误日志），不污染源码目录
+    // GetTempPathW 只解析环境变量，不保证目录存在或可写。
+    // 系统临时目录不可用时，回退到 exe 同级目录，直接运行 exe 也能生效。
+    TemporaryFiles temporary;
+    std::string systemTempError;
     wchar_t tempDir[MAX_PATH] = {};
     const DWORD tempLength = GetTempPathW(MAX_PATH, tempDir);
+    bool haveTemporaryFiles = false;
     if (tempLength == 0 || tempLength >= MAX_PATH)
     {
         const DWORD code = tempLength == 0 ? GetLastError() : ERROR_INSUFFICIENT_BUFFER;
-        errorMessage = WindowsError("Failed to resolve shader temporary directory.", tempDir, code);
-        return {};
+        systemTempError = WindowsError("Failed to resolve shader temporary directory.", tempDir, code);
+    }
+    else
+    {
+        haveTemporaryFiles = temporary.Create(tempDir, systemTempError);
     }
 
-    TemporaryFiles temporary;
-    wchar_t tempFile[MAX_PATH] = {};
-    if (GetTempFileNameW(tempDir, L"gpr", 0, tempFile) == 0)
+    if (!haveTemporaryFiles)
     {
-        errorMessage = WindowsError("Failed to create temporary DXIL file.", tempDir, GetLastError());
-        return {};
+        const std::wstring exeDirectory = GetExecutableDirectory();
+        if (exeDirectory.empty())
+        {
+            errorMessage = systemTempError + "\nFailed to resolve executable directory for fallback.";
+            return {};
+        }
+        const std::wstring fallback = exeDirectory + L"shader-temp";
+        if (!CreateDirectoryW(fallback.c_str(), nullptr))
+        {
+            const DWORD code = GetLastError();
+            if (code != ERROR_ALREADY_EXISTS)
+            {
+                errorMessage = systemTempError + "\nFallback: " +
+                    WindowsError("Failed to create shader temporary directory.", fallback, code);
+                return {};
+            }
+        }
+        std::string fallbackError;
+        if (!temporary.Create(fallback, fallbackError))
+        {
+            errorMessage = systemTempError + "\nFallback: " + fallbackError;
+            return {};
+        }
     }
-    temporary.output = tempFile;
-    if (GetTempFileNameW(tempDir, L"gpr", 0, tempFile) == 0)
-    {
-        errorMessage = WindowsError("Failed to create temporary DXC log file.", tempDir, GetLastError());
-        return {};
-    }
-    temporary.log = tempFile;
     const std::wstring& outputPath = temporary.output;
     const std::wstring& errorPath = temporary.log;
 
@@ -128,22 +208,11 @@ std::vector<std::uint8_t> ShaderCompiler::Compile(const std::wstring& hlslFileNa
                                  L" \"" + hlslPath + L"\" -Fo \"" + outputPath + L"\"";
 
     // stderr（+ stdout）重定向到文件，避免用管道（且能完整保留 dxc 的多行错误）。
-    SECURITY_ATTRIBUTES sa = {};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    HANDLE logFile = CreateFileW(errorPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
-                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (logFile == INVALID_HANDLE_VALUE)
-    {
-        errorMessage = WindowsError("Failed to open temporary DXC log file.", errorPath, GetLastError());
-        return {};
-    }
-
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = logFile;
-    si.hStdError = logFile;
+    si.hStdOutput = temporary.logHandle;
+    si.hStdError = temporary.logHandle;
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
     PROCESS_INFORMATION pi = {};
@@ -153,7 +222,6 @@ std::vector<std::uint8_t> ShaderCompiler::Compile(const std::wstring& hlslFileNa
     if (!launched)
     {
         const DWORD code = GetLastError();
-        CloseHandle(logFile);
         errorMessage = WindowsError("Failed to launch dxc.exe. Check DXC_PATH or the Windows SDK.", dxc, code);
         return {};
     }
@@ -165,7 +233,7 @@ std::vector<std::uint8_t> ShaderCompiler::Compile(const std::wstring& hlslFileNa
     const DWORD exitError = gotExitCode ? ERROR_SUCCESS : GetLastError();
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    CloseHandle(logFile);
+    temporary.CloseLog();
 
     if (waitResult != WAIT_OBJECT_0 || !gotExitCode)
     {
@@ -246,13 +314,5 @@ std::wstring ShaderCompiler::FindDxc()
 std::wstring ShaderCompiler::GetShaderDirectory()
 {
     // shader 目录 = exe 所在目录 + "shaders"
-    wchar_t exePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    std::wstring dir(exePath);
-    const size_t pos = dir.find_last_of(L"\\/");
-    if (pos != std::wstring::npos)
-    {
-        dir = dir.substr(0, pos);
-    }
-    return dir + L"\\shaders\\";
+    return GetExecutableDirectory() + L"shaders\\";
 }
