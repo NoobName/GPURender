@@ -2,7 +2,8 @@
 
 #include <windows.h>
 
-bool Application::Initialize()
+bool Application::Initialize(std::uint32_t initialInstanceCount, bool useCpuCulling,
+                             float cameraYawDegrees, int debugViewMode)
 {
     // 1. D3D12 上下文（Debug Layer -> Factory -> Adapter -> Device）
     if (!m_d3d12.Initialize())
@@ -12,7 +13,8 @@ bool Application::Initialize()
 
     // 2. Win32 窗口（先于 Renderer 创建，因为 SwapChain 需要 HWND）
     const HINSTANCE hInstance = GetModuleHandleW(nullptr);
-    if (!m_window.Initialize(hInstance, L"GPUDrivenRenderer - M6: Asset Rendering", 1280, 720))
+    if (!m_window.Initialize(hInstance, L"GPUDrivenRenderer - M7: CPU-Driven Instance Baseline",
+                             1280, 720))
     {
         return false;
     }
@@ -20,7 +22,9 @@ bool Application::Initialize()
 
     // 3. 渲染器（需要 device + factory + hwnd）
     if (!m_renderer.Initialize(m_d3d12.GetDevice(), m_d3d12.GetFactory(),
-                               m_window.GetHandle(), m_window.GetWidth(), m_window.GetHeight()))
+                               m_window.GetHandle(), m_window.GetWidth(), m_window.GetHeight(),
+                               initialInstanceCount, useCpuCulling,
+                               cameraYawDegrees, debugViewMode))
     {
         return false;
     }
@@ -44,6 +48,13 @@ void Application::Run()
             }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        // 把窗口收集到的按键转给渲染器（切换实例规模 / 剔除开关）。
+        // Window 本身不认识 Renderer，Application 负责把两者接起来。
+        for (const UINT key : m_window.TakePendingKeyPresses())
+        {
+            m_renderer.HandleKey(key);
         }
 
         m_renderer.Render();

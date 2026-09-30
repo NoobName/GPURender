@@ -26,8 +26,11 @@ add_executable(GPUDrivenRenderer
     src/Render/Camera.cpp
     src/Render/Mesh.cpp
     src/Render/Texture.cpp
+    src/Render/DebugText.cpp
+    src/Render/DebugLines.cpp
     src/Asset/ObjLoader.cpp
     src/Asset/TgaLoader.cpp
+    src/Scene/Scene.cpp
 )
 
 target_include_directories(GPUDrivenRenderer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

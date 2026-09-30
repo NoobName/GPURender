@@ -69,6 +69,13 @@ void Window::Show()
     UpdateWindow(m_hwnd);
 }
 
+std::vector<UINT> Window::TakePendingKeyPresses()
+{
+    std::vector<UINT> keys;
+    keys.swap(m_pendingKeyPresses); // swap 而非拷贝，顺便把内部缓冲清空
+    return keys;
+}
+
 LRESULT CALLBACK Window::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     Window* self = nullptr;
@@ -92,6 +99,15 @@ LRESULT CALLBACK Window::WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         {
             self->m_width  = static_cast<int>(LOWORD(lParam));
             self->m_height = static_cast<int>(HIWORD(lParam));
+        }
+        return 0;
+
+    case WM_KEYDOWN:
+        // 只记录「首次按下」：lParam 的 bit30 为 1 表示这是按住产生的自动重复，
+        // 对切换场景规模这种重操作来说，重复触发会造成明显的卡顿。
+        if (self != nullptr && (lParam & (1 << 30)) == 0)
+        {
+            self->m_pendingKeyPresses.push_back(static_cast<UINT>(wParam));
         }
         return 0;
 

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <windows.h>
+
 #include <string>
+#include <vector>
 
 // 纯 Win32 窗口封装。
 // 职责：注册窗口类、创建窗口、分发消息、暴露 HWND 与客户区尺寸。
@@ -23,6 +25,10 @@ public:
     int GetWidth() const { return m_width; }
     int GetHeight() const { return m_height; }
 
+    // 取出自上次调用以来按下的键（VK_* 编码）并清空队列。
+    // 窗口层只负责「收集按键」，具体怎么解释由上层决定 —— 这样 Window 仍然不依赖渲染器。
+    std::vector<UINT> TakePendingKeyPresses();
+
 private:
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -31,4 +37,5 @@ private:
     std::wstring m_title;
     int m_width = 0;
     int m_height = 0;
+    std::vector<UINT> m_pendingKeyPresses;
 };

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "Window.h"
 #include "Graphics/D3D12Context.h"
 #include "Render/Renderer.h"
@@ -9,7 +11,11 @@
 class Application
 {
 public:
-    bool Initialize();
+    // 这些参数都来自命令行，仅用于启动配置；运行中可用按键改变。
+    bool Initialize(std::uint32_t initialInstanceCount = 1000,
+                    bool useCpuCulling = true,
+                    float cameraYawDegrees = 0.0f,
+                    int debugViewMode = 0);
     void Run();
     void Shutdown();
 
