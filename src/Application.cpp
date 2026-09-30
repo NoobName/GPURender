@@ -1,0 +1,67 @@
+#include "Application.h"
+
+#include <windows.h>
+
+bool Application::Initialize()
+{
+    // 1. D3D12 上下文（Debug Layer -> Factory -> Adapter -> Device）
+    if (!m_d3d12.Initialize())
+    {
+        return false;
+    }
+
+    // 2. Win32 窗口（先于 Renderer 创建，因为 SwapChain 需要 HWND）
+    const HINSTANCE hInstance = GetModuleHandleW(nullptr);
+    if (!m_window.Initialize(hInstance, L"GPUDrivenRenderer - M6: Asset Rendering", 1280, 720))
+    {
+        return false;
+    }
+    m_window.Show();
+
+    // 3. 渲染器（需要 device + factory + hwnd）
+    if (!m_renderer.Initialize(m_d3d12.GetDevice(), m_d3d12.GetFactory(),
+                               m_window.GetHandle(), m_window.GetWidth(), m_window.GetHeight()))
+    {
+        return false;
+    }
+
+    m_initialized = true;
+    return true;
+}
+
+void Application::Run()
+{
+    // Game loop：PeekMessage 非阻塞，每帧先处理窗口消息、再渲染。
+    // WM_QUIT 由 Window::WindowProc 在 WM_DESTROY 时投递，收到即退出循环。
+    MSG msg = {};
+    while (true)
+    {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            if (msg.message == WM_QUIT)
+            {
+                return;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        m_renderer.Render();
+    }
+}
+
+void Application::Shutdown()
+{
+    if (!m_initialized)
+    {
+        return;
+    }
+
+    // 释放顺序：先 Renderer（内部会等待 GPU 完成所有 in-flight 工作），
+    // 再销毁窗口，最后释放 D3D12 上下文（导出 Debug 消息并检漏）。
+    m_renderer.Shutdown();
+    m_window.Shutdown();
+    m_d3d12.Shutdown();
+
+    m_initialized = false;
+}

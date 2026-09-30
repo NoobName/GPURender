@@ -1,0 +1,30 @@
+# Build output
+/build/
+/out/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Compile artifacts
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.exp
+
+# 例外：assets/ 下的 .obj 是 Wavefront 网格资源，不是编译产物，必须入库
+!assets/*.obj
+
+# Shader compile artifacts (later milestones)
+*.cso
+*.dxil
+
+# CMake
+CMakeUserPresets.json
+
+# Local-only documentation (learning notes etc., kept out of the public repo)
+/docs/
