@@ -1,7 +1,6 @@
 # GPUDrivenRenderer
 
 一个从零构建的现代 GPU-Driven 实时渲染器，使用 C++20、DirectX 12 与 HLSL。
-目标是展示 Graphics / Rendering / GPU Software Engineer 岗位所需的核心能力。
 
 ## 当前状态
 
