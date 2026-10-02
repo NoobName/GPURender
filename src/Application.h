@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <cstdint>
 
@@ -17,7 +17,11 @@ public:
                     float cameraYawDegrees = 0.0f,
                     int debugViewMode = 0,
                     bool compareCulling = false,
-                    bool gpuDriven = false);
+                    bool gpuDriven = false,
+                    bool depthPrepass = true,
+                    bool depthVisualize = false,
+                    bool hzbVisualize = false, std::uint32_t hzbMip = 0,
+                    bool occlusion = true, bool occlusionViz = false);
     void Run();
     void Shutdown();
 

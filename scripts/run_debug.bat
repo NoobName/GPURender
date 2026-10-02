@@ -34,6 +34,11 @@ set "PATH=%VCToolsRedistDir%debug_nonredist\x64\Microsoft.VC145.DebugCRT;%PATH%"
 set "PATH=%WindowsSdkBinPath%%WindowsSDKVersion%x64\ucrt;%PATH%"
 
 REM ---- 4. Run ----
+set "RENDERER_EXE=%~dp0..\build\nmake-debug\GPUDrivenRenderer.exe"
+if not exist "%RENDERER_EXE%" (
+    echo [ERROR] Debug executable not found. Run scripts\build_debug.bat first.
+    exit /b 1
+)
 REM Keep runtime shader files in a writable, project-local directory.
 REM setlocal limits these environment changes to this script and its child process.
 set "TMP=%~dp0..\build\nmake-debug\temp"
@@ -43,6 +48,6 @@ if not exist "%TMP%\" (
     echo [ERROR] Cannot create shader temporary directory: "%TMP%"
     exit /b 1
 )
-"%~dp0..\build\nmake-debug\GPUDrivenRenderer.exe"
+"%RENDERER_EXE%" %*
 set "RUN_EXIT_CODE=%ERRORLEVEL%"
 endlocal & exit /b %RUN_EXIT_CODE%

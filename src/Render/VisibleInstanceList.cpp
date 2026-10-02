@@ -57,30 +57,34 @@ bool VisibleInstanceList::Initialize(ID3D12Device* device,
                                      UINT indicesUavSlot,
                                      UINT countUavSlot,
                                      UINT indicesSrvSlot,
-                                     UINT countSrvSlot)
+                                     UINT countSrvSlot,
+                                     std::uint32_t segments)
 {
-    if (maxInstances == 0)
+    if (maxInstances == 0 || segments == 0)
     {
-        std::cerr << "[VisibleInstanceList] maxInstances must be > 0\n";
+        std::cerr << "[VisibleInstanceList] maxInstances and segments must be > 0\n";
         return false;
     }
 
     m_capacity = maxInstances;
+    m_segments = segments;
     m_indicesUavSlot = indicesUavSlot;
     m_countUavSlot = countUavSlot;
     m_indicesSrvSlot = indicesSrvSlot;
     m_countSrvSlot = countSrvSlot;
 
-    // ---- 1. 索引缓冲：容量按最大实例数（最坏情况全部可见）----
-    const UINT64 indexBytes = static_cast<UINT64>(maxInstances) * sizeof(std::uint32_t);
+    // ---- 1. 索引缓冲：容量 = 单段容量 × 段数（最坏情况每段都全满）----
+    const UINT64 totalElements = static_cast<UINT64>(maxInstances) * segments;
+    const UINT64 indexBytes = totalElements * sizeof(std::uint32_t);
     if (!CreateUavBuffer(device, indexBytes, &m_indices))
     {
         std::cerr << "[VisibleInstanceList] Failed to create index buffer.\n";
         return false;
     }
 
-    // ---- 2. 计数器：4 字节 ----
-    if (!CreateUavBuffer(device, sizeof(std::uint32_t), &m_count))
+    // ---- 2. 计数器：每个分段一个 uint ----
+    const UINT64 countBytes = static_cast<UINT64>(segments) * sizeof(std::uint32_t);
+    if (!CreateUavBuffer(device, countBytes, &m_count))
     {
         std::cerr << "[VisibleInstanceList] Failed to create count buffer.\n";
         return false;
@@ -97,18 +101,21 @@ bool VisibleInstanceList::Initialize(ID3D12Device* device,
     uavDesc.Format = DXGI_FORMAT_UNKNOWN; // StructuredBuffer 必须用 UNKNOWN
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     uavDesc.Buffer.FirstElement = 0;
-    uavDesc.Buffer.NumElements = maxInstances;
+    uavDesc.Buffer.NumElements = static_cast<UINT>(totalElements);
     uavDesc.Buffer.StructureByteStride = sizeof(std::uint32_t);
     uavDesc.Buffer.CounterOffsetInBytes = 0;
     uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
     device->CreateUnorderedAccessView(m_indices.Get(), nullptr, &uavDesc, indexHandle);
 
     // counter 是「裸」缓冲：用 RAW（R32_UINT）视图而不是 StructuredBuffer 视图。
-    // NumElements = 1，元素就是那个 uint。
+    // NumElements = segments：每个分段一个计数器。
+    //
+    // **注意**：ClearUnorderedAccessViewUint 在 NumRects = 0 时会清空**整个资源**，
+    // 所以一次调用就能把所有分段的计数器归零，不需要逐段清理。
     uavDesc.Format = DXGI_FORMAT_R32_UINT;
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     uavDesc.Buffer.FirstElement = 0;
-    uavDesc.Buffer.NumElements = 1;
+    uavDesc.Buffer.NumElements = segments;
     uavDesc.Buffer.StructureByteStride = 0; // RAW 视图必须为 0
     uavDesc.Buffer.CounterOffsetInBytes = 0;
     uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
@@ -142,7 +149,7 @@ bool VisibleInstanceList::Initialize(ID3D12Device* device,
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Buffer.FirstElement = 0;
-    srvDesc.Buffer.NumElements = maxInstances;
+    srvDesc.Buffer.NumElements = static_cast<UINT>(totalElements);
     srvDesc.Buffer.StructureByteStride = sizeof(std::uint32_t);
     srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
 
@@ -153,7 +160,7 @@ bool VisibleInstanceList::Initialize(ID3D12Device* device,
 
     // 计数器用 RAW SRV（与它的 UAV 视图对应）
     srvDesc.Format = DXGI_FORMAT_R32_UINT;
-    srvDesc.Buffer.NumElements = 1;
+    srvDesc.Buffer.NumElements = segments;
     srvDesc.Buffer.StructureByteStride = 0;
 
     D3D12_CPU_DESCRIPTOR_HANDLE countSrvHandle =

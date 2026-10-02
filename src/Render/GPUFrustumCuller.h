@@ -51,18 +51,33 @@ public:
     // 与 shaders/FrustumCullingCS.hlsl 的 [numthreads(64,1,1)] 保持一致
     static constexpr UINT kThreadGroupSize = 64;
 
-    bool Initialize(ID3D12Device* device, std::uint32_t maxInstances);
+    bool Initialize(ID3D12Device* device, std::uint32_t maxInstances,
+                    ID3D12DescriptorHeap* descriptorHeap, UINT descriptorSize,
+                    UINT instanceLodUavSlot);
 
-    // 每帧调用：记录「清零计数 -> dispatch 压缩」这一整段。
+    // 每帧调用：记录「清零计数 -> dispatch 剔除 + LOD 选择 + 压缩」这一整段。
     //
     // planes 必须是**已归一化**的 6 个视锥平面 (nx, ny, nz, d)，
     // 且与 CPU 侧剔除使用的完全一致 —— 这是两边结果可比的前提。
+    //
+    // M16 新增的参数全部服务于 LOD 选择：
+    //   viewProj        行主序 view*proj（投影尺寸需要）
+    //   proj11          投影矩阵 [1][1]（世界半径 -> NDC 半径）
+    //   lodBias         全局 LOD 偏置（正数 = 更偏向高精度）
+    //   lodMetadataSrvSlot  MeshLODRange 数组的 SRV 槽位
+    //   lodCount        级数（= 分段数）
+    //   segmentCapacity 每段容量（= maxInstances）
     void Record(ID3D12GraphicsCommandList* cmd,
                 ID3D12DescriptorHeap* descriptorHeap,
                 UINT descriptorSize,
                 UINT instanceSrvSlot,
+                UINT lodMetadataSrvSlot,
                 VisibleInstanceList& visibleList,
                 const DirectX::XMFLOAT4 planes[6],
+                const DirectX::XMFLOAT4X4& viewProj,
+                float proj11,
+                float lodBias,
+                std::uint32_t lodCount,
                 std::uint32_t instanceCount);
 
     // 调试用（按 G 键 / --compare-cull）：把压缩列表读回来与 CPU 结果对比。
@@ -88,9 +103,13 @@ public:
         return (instanceCount + kThreadGroupSize - 1u) / kThreadGroupSize;
     }
 
+    // M16：每实例 LOD（仅可视化用）。索引 = 实例下标，值 = 所选 LOD。
+    ID3D12Resource* GetInstanceLODBuffer() const { return m_instanceLOD.Get(); }
+
 private:
     ComPtr<ID3D12RootSignature> m_rootSignature;
     ComPtr<ID3D12PipelineState> m_pipelineState;
+    ComPtr<ID3D12Resource> m_instanceLOD;
 
     // READBACK Heap：
     //   [0, 4)                 -> visibleCount（1 个 uint）
@@ -99,6 +118,7 @@ private:
     ComPtr<ID3D12Resource> m_readbackBuffer;
 
     std::uint32_t m_capacity = 0;
+    UINT m_instanceLodUavSlot = 0;
     UINT64 m_countReadbackOffset = 0;
     UINT64 m_indicesReadbackOffset = 0;
 

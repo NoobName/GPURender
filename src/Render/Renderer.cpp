@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -79,12 +80,27 @@ std::string GetExecutableDirectory()
 bool Renderer::Initialize(ID3D12Device* device, IDXGIFactory4* factory, HWND hwnd,
                           UINT width, UINT height, std::uint32_t initialInstanceCount,
                           bool useCpuCulling, float cameraYawDegrees, int debugViewMode,
-                          bool compareCullingAtStartup, bool gpuDriven)
+                          bool compareCullingAtStartup, bool gpuDriven,
+                          bool depthPrepass, bool depthVisualize,
+                          bool hzbVisualize, std::uint32_t hzbMip,
+                          bool occlusion, bool occlusionViz)
 {
     m_cpuCullingEnabled = useCpuCulling;
     m_cameraYawDegrees = cameraYawDegrees;
     m_debugViewMode = debugViewMode;
     m_renderMode = gpuDriven ? RenderMode::GpuDriven : RenderMode::CpuDriven;
+    m_depthPrepassEnabled = depthPrepass;
+    m_depthVisualizeEnabled = depthVisualize;
+    m_hzbVisualizeEnabled = hzbVisualize;
+    m_hzbViewMip = hzbMip;
+    m_occlusionEnabled = occlusion;
+    m_occlusionVisualize = occlusionViz;
+    // 遮挡剔除可视化本身依赖「包围球」这一层的调试线框，
+    // 所以开启它时自动把 debug viz 提到第 2 级（视锥 + 包围球）。
+    if (occlusionViz && m_debugViewMode < 2)
+    {
+        m_debugViewMode = 2;
+    }
     m_device = device; // 场景切换时需要重新上传实例数据
 
     m_hwnd = hwnd;
@@ -106,25 +122,46 @@ bool Renderer::Initialize(ID3D12Device* device, IDXGIFactory4* factory, HWND hwn
     if (!CreateCommandAllocators(device)) return false;
     if (!CreateCommandList(device)) return false;
     if (!CreateSyncObjects(device)) return false;
-    if (!CreateSrvDescriptorHeap(device)) return false; // 必须先于 CreateAssets（要往里写 SRV）
+    if (!CreateSrvDescriptorHeap(device)) return false;
     if (!CreateRootSignature(device)) return false;
-    if (!CreatePipelineState(device)) return false;      // 网格 PSO
-    if (!CreateUiPipelineState(device)) return false;    // UI 叠加 PSO
-    if (!CreateDebugPipelineState(device)) return false; // 调试线框 PSO
-
+    if (!CreatePipelineState(device)) return false;
+    if (!CreateUiPipelineState(device)) return false;
+    if (!CreateDebugPipelineState(device)) return false;
     if (!CreateGpuDrivenRootSignature(device)) return false;
-
     if (!CreateGpuDrivenPipelineState(device)) return false;
-
     if (!CreateDepthBuffer(device)) return false;
     if (!CreateConstantBuffers(device)) return false;
+    if (!CreateDepthOnlyPipelineState(device)) return false;      // M13
+    if (!CreateDepthVisualizePipelineState(device)) return false; // M13
+    if (!CreateHZBVisualizePipelineState(device)) return false;   // M14
+
+    // M14：层级深度金字塔。
+    // 必须放在 CreateDepthBuffer 之后 —— 它的第 0 级是从深度缓冲降采样得到的。
+    if (!m_hzb.Initialize(device, m_width, m_height, m_srvHeap.Get(),
+                          m_srvDescriptorSize, kHZBFirstMipUavSlot, kHZBSrvSlot))
+    {
+        std::cerr << "[Renderer] Failed to initialize HZB.\n";
+        return false;
+    }
+    m_hzbViewMip = 0;
+
+    // M15：HZB 遮挡剔除
+    if (!m_occlusionCuller.Initialize(device, kMaxInstances, m_srvHeap.Get(),
+                                     m_srvDescriptorSize,
+                                     kOcclusionStatsUavSlot, kOcclusionStatsSrvSlot))
+    {
+        std::cerr << "[Renderer] Failed to initialize occlusion culler.\n";
+        return false;
+    }
+
+    if (!m_gpuProfiler.Initialize(device, m_commandQueue.Get())) return false;
 
 
     // 相机：位置固定在场景内部（场景半径 55）。
     // 身后与视锥外的大量实例会被真正剔除，Visible Count 才有意义；
     // 若把相机远远放在球外，整个场景都落在视锥里，可见率恒为 100%。
     m_camera.SetPerspective(60.0f, static_cast<float>(m_width) / static_cast<float>(m_height),
-                            0.5f, 500.0f);
+                            m_nearPlane, m_farPlane);
     UpdateCamera(0.0);
 
     // 初始场景规模来自命令行（默认 1000），运行中按 1 / 2 / 3 可切换。
@@ -134,6 +171,9 @@ bool Renderer::Initialize(ID3D12Device* device, IDXGIFactory4* factory, HWND hwn
 
     if (!CreateAssets(device)) return false;
     if (!m_debugLines.Initialize(device)) return false;
+    // M14：一次性验证用的 readback 缓冲（不参与 HZB 的生成）
+    if (!CreateHZBVerifyReadback(device)) return false;
+    if (!CreateOcclusionDebugReadback(device)) return false; // M15
 
     // M9：上传完成后立刻验证一次，确认 C++ / HLSL 的布局约定一致。
     RunInstanceValidation();
@@ -189,6 +229,18 @@ void Renderer::Render()
     {
         m_validationRequested = false;
         RunInstanceValidation();
+    }
+
+    // M13：Depth Prepass 开关切换后需要重建 PSO
+    //（Main Pass 的深度状态是烘焙在 PSO 里的）。
+    if (m_pipelineStateRebuildRequested)
+    {
+        m_pipelineStateRebuildRequested = false;
+        if (!CreatePipelineState(m_device.Get()) ||
+            !CreateGpuDrivenPipelineState(m_device.Get()))
+        {
+            std::cerr << "[Renderer] Failed to rebuild PSOs after prepass toggle.\n";
+        }
     }
 
     // --compare-cull 延迟到第 60 帧：必须等 GPU 真正执行过命令生成与压缩，
@@ -309,9 +361,53 @@ void Renderer::Render()
                     &globalConstants, sizeof(globalConstants));
     }
 
+    // M13：深度可视化的常量（near/far + 1/分辨率）
+    {
+        struct DepthVisualizeConstants
+        {
+            XMFLOAT2 invResolution;
+            float nearPlane;
+            float farPlane;
+        };
+        DepthVisualizeConstants depthConstants = {};
+        depthConstants.invResolution = { 1.0f / static_cast<float>(m_width),
+                                         1.0f / static_cast<float>(m_height) };
+        depthConstants.nearPlane = m_nearPlane;
+        depthConstants.farPlane = m_farPlane;
+        std::memcpy(constantBase +
+                        static_cast<std::size_t>(kDepthVisualizeConstantSlot) * kConstantStride,
+                    &depthConstants, sizeof(depthConstants));
+    }
+
+    // M14：HZB 可视化的常量（当前查看的 mip + 总级数 + near/far）
+    {
+        struct HZBVisualizeConstants
+        {
+            std::uint32_t mipLevel;
+            std::uint32_t mipCount;
+            float nearPlane;
+            float farPlane;
+        };
+        HZBVisualizeConstants hzbConstants = {};
+        hzbConstants.mipLevel = m_hzbViewMip;
+        hzbConstants.mipCount = m_hzb.GetMipCount();
+        hzbConstants.nearPlane = m_nearPlane;
+        hzbConstants.farPlane = m_farPlane;
+        std::memcpy(constantBase +
+                        static_cast<std::size_t>(kHZBVisualizeConstantSlot) * kConstantStride,
+                    &hzbConstants, sizeof(hzbConstants));
+    }
+
     frame.constantBuffer.Unmap(0, nullptr);
 
     // 6. 生成调试线框与统计文本的顶点，并上传到 GPU（属于 CPU 侧的 update 阶段）。
+    //
+    //    M15：遮挡剔除可视化需要先把 GPU 的可见列表读回来（一次独立提交），
+    //    所以它必须排在 BuildDebugVisualization **之前** —— 后者要用到那份列表。
+    //    未开启可视化时这个调用会立刻返回，不产生任何提交。
+    BuildOcclusionDebugLines();
+    ReadbackInstanceLOD(); // M16：为 LOD 着色准备每实例的级数
+
     if (m_debugViewMode > 0)
     {
         BuildDebugVisualization(viewProj, m_visibleIndices);
@@ -335,7 +431,7 @@ void Renderer::Render()
     TransitionBackBuffer(m_commandList.Get(), backBuffer,
                          D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-    // 8. 视口 / 裁剪矩形 / 渲染目标绑定。
+    // 8. 视口 / 裁剪矩形。
     const D3D12_VIEWPORT viewport = {
         0.0f, 0.0f, static_cast<float>(m_width), static_cast<float>(m_height), 0.0f, 1.0f
     };
@@ -345,13 +441,14 @@ void Renderer::Render()
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += static_cast<SIZE_T>(backBufferIndex) * m_rtvDescriptorSize;
-    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
-    // 9. 清屏（颜色 + 深度）。
+    // 9. 清颜色。
+    //
+    //    注意**深度清屏不在这里** —— M13 把深度缓冲的所有权交给了 Depth Prepass，
+    //    由那一遍负责清深度并写入最近表面的深度值。两个 Pass 共用同一个
+    //    深度缓冲，清屏只应该发生一次。
     const float clearColor[4] = { 0.02f, 0.02f, 0.05f, 1.0f };
     m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-    m_commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
     // 10. 设置管线状态。根签名 / 描述符堆整帧只设一次 ——
     //     这正是要凸显的结构：昂贵的状态放循环外，廉价的绑定放循环内。
@@ -363,26 +460,45 @@ void Renderer::Render()
     ID3D12DescriptorHeap* const descriptorHeaps[] = { m_srvHeap.Get() };
     m_commandList->SetDescriptorHeaps(1, descriptorHeaps);
 
-    // 10a. GPU 视锥剔除 + Stream Compaction：每线程一个实例，
+    // M13：t0 —— 帧开始（在任何计算 Pass 之前）
+    m_gpuProfiler.WriteTimestamp(m_commandList.Get(), m_frameIndex,
+                               GPUProfiler::kSlotFrameBegin);
+
+    // M15/M16：遮挡剔除是否生效（M16 的 LOD 选择需要提前知道这一点，
+    // 因为两者目前不能叠加 —— 见 M16 Limitation）。
+    const bool occlusionActive = m_occlusionEnabled && m_depthPrepassEnabled && totalCount > 0;
+
+    // 10a. GPU 视锥剔除 + LOD 选择 + Stream Compaction：每线程一个实例，
     //      结果写进「压缩后的可见索引列表 + 计数器」。
     //      Dispatch 的线程组数 = ceil(instanceCount / 64)，见 GPUFrustumCuller。
     if (totalCount > 0)
     {
+        // M16：剔除 CS 现在同时做 LOD 选择，所以要额外传 viewProj 与投影参数。
+        const XMMATRIX cullProjection = m_camera.GetProjection();
+        XMFLOAT4X4 cullViewProjF4x4;
+        XMStoreFloat4x4(&cullViewProjF4x4, viewProj);
+
+        // 遮挡剔除目前只处理单段列表，所以两者同时开启时把 LOD 退化为 1 级。
+        const bool useLOD = m_lodEnabled && !occlusionActive;
+        const std::uint32_t cullLODCount = useLOD ? m_lodCount : 1u;
+
         m_frustumCuller.Record(m_commandList.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
-                               kInstanceSrvSlot, m_visibleList,
-                               m_lastFrustumPlanes, totalCount);
+                               kInstanceSrvSlot, kLODMetadataSrvSlot, m_visibleList,
+                               m_lastFrustumPlanes, cullViewProjF4x4,
+                               cullProjection.r[1].m128_f32[1],
+                               useLOD ? m_lodBias : -1.0f, // 偏置 -1 等价于强制 LOD0
+                               cullLODCount,
+                               totalCount);
     }
 
-    // 10b. GPU 命令生成：为每个可见实例生成一条 DrawIndexed 间接命令。
+    // 10b. GPU 命令生成：为**每个 LOD** 生成一条 DrawIndexed 间接命令。
     //
-    //      它读 10a 产出的压缩列表与计数器，写 indirect argument buffer。
-    //      **线程组数按容量上限取整**，实际写多少条由 GPU 内部的可见数决定 ——
-    //      这是 GPU-Driven 的核心特征：CPU 不知道也不需要知道命令条数。
+    //      它读 LOD 元数据 + 每级的实例计数器，写 indirect argument buffer。
+    //      实际画多少实例、用哪一级几何，**两个决定都在 GPU 上**。
     if (totalCount > 0)
     {
         m_indirectCommands.Record(m_commandList.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
-                                  m_visibleList,
-                                  m_stressMesh.GetIndexCount());
+                                  m_visibleList, kLODMetadataSrvSlot);
     }
 
     // 10c. 切到图形管线。两条路径各自的绑定完全不同，所以这里是分支点：
@@ -392,6 +508,86 @@ void Renderer::Render()
     const D3D12_VERTEX_BUFFER_VIEW& vertexBufferView = m_stressMesh.GetVertexBufferView();
     const D3D12_INDEX_BUFFER_VIEW& indexBufferView = m_stressMesh.GetIndexBufferView();
     const UINT indexCount = m_stressMesh.GetIndexCount();
+    const D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+
+    // M13：t1 —— GPU 剔除与命令生成结束（从这里开始才算图形 Pass）
+    m_gpuProfiler.WriteTimestamp(m_commandList.Get(), m_frameIndex,
+                               GPUProfiler::kSlotCullEnd);
+
+    // 10d. **参数缓冲进入 INDIRECT_ARGUMENT**。
+    //
+    //      这一步必须在**任何** ExecuteIndirect 之前完成 —— 包括 Depth Prepass。
+    //      上一步的命令生成 CS 刚把它当 UAV 写完，此刻它的状态是
+    //      UNORDERED_ACCESS；而 ExecuteIndirect 要求它处于
+    //      D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT（它告诉驱动这块内存
+    //      接下来由**命令处理器**读取，而不是被着色器读写）。
+    //
+    //      放在这里而不是放在各自的绘制函数里，是因为 Depth Pass 与 Main Pass
+    //      会**共用同一份命令**连续执行两次 —— 状态只需要转一次。
+    m_indirectCommands.TransitionTo(m_commandList.Get(),
+                                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    m_visibleList.TransitionIndicesTo(m_commandList.Get(),
+                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // 10e. **M13：Depth Prepass** —— 只写深度的一遍，用可见实例的间接命令绘制。
+    //
+    //      它排在 Main Pass 之前，把最近表面的深度先写进深度缓冲。
+    //      Main Pass 随后以 LESS_EQUAL + 不写深度的方式复用它，
+    //      被遮挡的片元在**像素着色之前**就被 Early-Z 丢弃。
+    if (m_depthPrepassEnabled && totalCount > 0)
+    {
+        RecordDepthPrepass();
+    }
+    else
+    {
+        // 关闭 prepass 时，深度缓冲仍然需要被清一次 ——
+        // 否则上一帧的深度会残留下来，Main Pass 靠它做测试会大面积失败。
+        TransitionDepthBuffer(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        m_commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        m_gpuProfiler.WriteTimestamp(m_commandList.Get(), m_frameIndex,
+                                   GPUProfiler::kSlotDepthEnd);
+    }
+
+    // 10g. **M14：构建 HZB（层级深度金字塔）**。
+    //
+    //      它读上面那一遍写出的全分辨率深度，逐级 2x2 Max 归约到 1x1。
+    //      整个金字塔**全部在 GPU 上生成** —— CPU 不参与、不回读任何一级。
+    //
+    //      为什么放在这里：HZB 描述的是「本帧的不透明几何深度」，
+    //      所以必须在深度 Pass **之后**、Main Pass 之前（下一帧做遮挡剔除时
+    //      用的就是这个金字塔）。
+    RecordHZBBuild();
+
+    // 10h. **M15：HZB 遮挡剔除**。
+    //
+    //      这是 M15 新增的一步：拿刚构建好的 HZB 对「视锥内候选」做保守遮挡测试，
+    //      输出真正需要着色的可见列表。
+    //
+    //      注意它与 Depth Prepass 的分工：
+    //        Depth Prepass 画的是**全部候选**（它的目的只是把深度铺出来）；
+    //        遮挡剔除之后 Main Pass 只画**真正可见**的那些。
+    //      所以省下的是 Main Pass 的绘制量（顶点处理 + 像素着色）。
+    RecordOcclusionCulling(m_frameIndex);
+
+    // 10i. **第二次命令生成**：这次为「遮挡剔除后的可见列表」写出命令。
+    //
+    //      它覆盖 10b 写出的那份命令 —— 这是安全的，因为命令缓冲是**顺序消费**的：
+    //      Depth Prepass 用的那一份已经在 10e 执行完毕。
+    if (occlusionActive)
+    {
+        m_indirectCommands.Record(m_commandList.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
+                                  m_occlusionCuller.GetVisibleList(), kLODMetadataSrvSlot);
+
+        // 参数缓冲再次被 CS 当 UAV 写过，所以要再转一次 INDIRECT_ARGUMENT；
+        // 可见列表也要重新变成 SRV 给顶点着色器读。
+        m_indirectCommands.TransitionTo(m_commandList.Get(),
+                                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+        m_occlusionCuller.GetVisibleList().TransitionIndicesTo(
+            m_commandList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
+    // 10j. Main Pass 的渲染目标绑定（Depth Prepass 时绑定的是 0 个 RTV）。
+    m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
     if (m_renderMode == RenderMode::GpuDriven)
     {
@@ -399,7 +595,17 @@ void Renderer::Render()
         m_stats.submittedDrawCalls = 0;    // CPU 侧一次 draw 都没有提交
         m_stats.indirectExecuteCount = 1;  // 只有一次 ExecuteIndirect
 
-        RecordGpuDrivenDraw(indexCount, submitCount);
+        // Main Pass 用哪一份索引列表取决于遮挡剔除是否生效：
+        //   遮挡剔除关闭 -> 视锥候选列表（**per-LOD 分段**，每级一个 SRV）
+        //   遮挡剔除开启 -> occlusion 的可见列表（当前是单段，见下方 Limitation）
+        //
+        // M16 Limitation：per-LOD 的遮挡剔除尚未实现，所以两者同时开启时
+        // 只有 LOD0 生效（lodCount 会被强制成 1，见 10a）。
+        const UINT srvBaseSlot = occlusionActive
+                                     ? m_occlusionCuller.GetVisibleList().GetIndicesSrvSlot()
+                                     : kLODSegmentSrvSlot;
+        const std::uint32_t drawLODCount = occlusionActive ? 1u : m_lodCount;
+        RecordGpuDrivenDraw(submitCount, srvBaseSlot, drawLODCount);
     }
     else
     {
@@ -433,9 +639,8 @@ void Renderer::Render()
 
     // 12. 调试线框（视锥 / 包围球）：换 PSO（LINELIST 拓扑、关闭深度测试），其余状态复用。
     //
-    //     注意它用的是**主根签名**，所以 GPU-Driven 模式下必须先切回来 ——
-    //     否则管线状态与当前根签名不匹配（Debug Layer 会直接报错）。
-    if (m_debugLines.HasContent())
+    //     M13：深度可视化开着时就跳过场景叠加（它本来就是要「只看深度」）。
+    if (m_debugLines.HasContent() && !m_depthVisualizeEnabled)
     {
         m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
         m_commandList->SetPipelineState(m_debugPipelineState.Get());
@@ -447,6 +652,23 @@ void Renderer::Render()
         // Render() 把拓扑改成了 LINELIST，后面 UI 用的是三角形，必须改回来
         m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     }
+
+    // 12b. M13：深度可视化 —— 全屏三角形采样深度缓冲，覆盖整个画面。
+    //      HZB 可视化开着时以它为准（两者都是全屏覆盖，同时开会互相覆盖）。
+    if (m_depthVisualizeEnabled && !m_hzbVisualizeEnabled)
+    {
+        RecordDepthVisualization();
+    }
+
+    // 12c. M14：HZB mip 可视化 —— 任选一级金字塔放大铺满屏幕。
+    if (m_hzbVisualizeEnabled)
+    {
+        RecordHZBVisualization();
+    }
+
+    // 12d. 时间戳：Main Pass 结束（含深度/HZB 可视化，如果开了的话）
+    m_gpuProfiler.WriteTimestamp(m_commandList.Get(), m_frameIndex,
+                                 GPUProfiler::kSlotMainEnd);
 
     // 13. UI 叠加：切换 PSO（alpha 混合、关闭深度），其余状态复用。
     if (m_debugText.HasContent())
@@ -468,7 +690,13 @@ void Renderer::Render()
     TransitionBackBuffer(m_commandList.Get(), backBuffer,
                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 
-    // 14. 关闭命令列表并提交，Present，Signal。
+    // 14. M13：GPU 时间戳解析。
+    //     ResolveQueryData 本身是一条命令，必须在 Close 之前记录。
+    //     它把查询堆里的三个时间点拷进 readback 缓冲，CPU 在**若干帧之后**
+    //     才去读那一帧的结果 —— 那时 GPU 早已写完，Map 不会阻塞。
+    m_gpuProfiler.Resolve(m_commandList.Get(), m_frameIndex);
+
+    // 15. 关闭命令列表并提交，Present，Signal。
     m_commandList->Close();
     QueryPerformanceCounter(&counter2);
 
@@ -483,6 +711,26 @@ void Renderer::Render()
     frame.fenceValue = m_fenceValue;
 
     m_frameIndex = (m_frameIndex + 1) % kFrameCount;
+
+    // M13：读回**若干帧之前**的时间戳（那时 GPU 早已完成，不会阻塞）。
+    // 用 kFrameCount 作为延迟帧数，正好是「这个 frame slot 被复用」的时刻。
+    {
+        double cullMs = 0.0;
+        double depthMs = 0.0;
+        double mainMs = 0.0;
+        // M15：遮挡剔除统计（同样延迟读回，不阻塞）
+        m_occlusionStats = m_occlusionCuller.ReadbackStats(m_frameIndex);
+        {
+        }
+
+        if (m_gpuProfiler.ReadbackCompletedFrame(m_frameIndex, cullMs, depthMs, mainMs))
+        {
+            constexpr double kSmoothing = 0.1;
+            m_avgGpuCullMs = m_avgGpuCullMs * (1.0 - kSmoothing) + cullMs * kSmoothing;
+            m_avgGpuDepthMs = m_avgGpuDepthMs * (1.0 - kSmoothing) + depthMs * kSmoothing;
+            m_avgGpuMainMs = m_avgGpuMainMs * (1.0 - kSmoothing) + mainMs * kSmoothing;
+        }
+    }
 
     // 16. 统计：换算成毫秒，并做指数滑动平均（原始值每帧跳动太大，看不清趋势）。
     //
@@ -518,6 +766,7 @@ void Renderer::Render()
                   << " visible=" << m_stats.visibleInstances
                   << " culled=" << m_stats.culledInstances
                   << " mode=" << (m_stats.gpuDriven ? "gpu" : "cpu")
+                  << " prepass=" << (m_depthPrepassEnabled ? "on" : "off")
                   << " cpuDraws=" << m_stats.submittedDrawCalls
                   << " execIndirect=" << m_stats.indirectExecuteCount
                   << " culling=" << (m_cpuCullingEnabled ? "on" : "off")
@@ -525,7 +774,10 @@ void Renderer::Render()
                   << " cull=" << m_avgCullMs << "ms"
                   << " update=" << m_avgUpdateMs << "ms"
                   << " record=" << m_avgRecordMs << "ms"
-                  << " present=" << m_avgPresentMs << "ms\n";
+                  << " present=" << m_avgPresentMs << "ms"
+                  << " gpuCull=" << m_avgGpuCullMs << "ms"
+                  << " gpuDepth=" << m_avgGpuDepthMs << "ms"
+                  << " gpuMain=" << m_avgGpuMainMs << "ms\n";
     }
 }
 
@@ -774,10 +1026,18 @@ bool Renderer::CreatePipelineState(ID3D12Device* device)
     desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     desc.SampleMask = UINT_MAX;
     desc.RasterizerState = MeshRasterizerState();
-    // 深度模板：开启深度测试（写入全部、比较 LESS）
+    // 深度模板：开启深度测试。
+    //
+    // M13：开了 Depth Prepass 之后，这一遍**复用** prepass 写好的深度：
+    //   关闭深度写入 + 放宽成 LESS_EQUAL（两遍的深度值逐位一致，
+    //   用严格的 LESS 会把自己刚写的深度判失败，画面会全空）。
     desc.DepthStencilState.DepthEnable = TRUE;
-    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    desc.DepthStencilState.DepthWriteMask = m_depthPrepassEnabled
+                                                ? D3D12_DEPTH_WRITE_MASK_ZERO
+                                                : D3D12_DEPTH_WRITE_MASK_ALL;
+    desc.DepthStencilState.DepthFunc = m_depthPrepassEnabled
+                                           ? D3D12_COMPARISON_FUNC_LESS_EQUAL
+                                           : D3D12_COMPARISON_FUNC_LESS;
     desc.DepthStencilState.StencilEnable = FALSE;
     desc.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
     desc.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
@@ -870,6 +1130,25 @@ bool Renderer::CreateDepthBuffer(ID3D12Device* device)
     device->CreateDepthStencilView(m_depthBuffer.Get(), &dsvDesc,
                                    m_dsvHeap->GetCPUDescriptorHandleForHeapStart());
 
+    // 4. SRV（M13）：把 D32_FLOAT 以 R32_FLOAT 暴露给着色器，用于深度可视化。
+    //
+    //    同一个资源可以同时有 DSV 与 SRV 两个视图，但**不能在同一次访问里
+    //    同时使用** —— 所以采样深度之前必须把资源从 DEPTH_WRITE 转到
+    //    PIXEL_SHADER_RESOURCE（见 Renderer::TransitionDepthBuffer）。
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.PlaneSlice = 0;
+    srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE depthSrvHandle =
+        m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    depthSrvHandle.ptr += static_cast<SIZE_T>(kDepthSrvSlot) * m_srvDescriptorSize;
+    device->CreateShaderResourceView(m_depthBuffer.Get(), &srvDesc, depthSrvHandle);
+
     return true;
 }
 
@@ -889,7 +1168,7 @@ bool Renderer::CreateConstantBuffers(ID3D12Device* device)
     // 注意这里用的是「最后一个槽位的下标 + 1」——
     // 每加一个新的专用槽位都必须同步这个表达式，否则会出现
     // 「槽位下标有效但缓冲装不下」的越界（表现是绑定 CBV 时直接崩溃）。
-    constexpr UINT kLastConstantSlot = kGlobalConstantSlot;
+    constexpr UINT kLastConstantSlot = kHZBVisualizeConstantSlot;
     const std::uint64_t bufferSize =
         static_cast<std::uint64_t>(kLastConstantSlot + 1) * kConstantStride;
 
@@ -925,11 +1204,12 @@ bool Renderer::CreateAssets(ID3D12Device* device)
     // 所以先收集起来，等 fence 等待完成再统一释放。
     std::vector<ComPtr<ID3D12Resource>> stagingResources;
 
-    // 场景统一使用的网格：立方体（12 个三角形）。
-    // 刻意用低模 —— M7 测量的是 **CPU 提交开销**，必须让 GPU 端不成为瓶颈，
-    // 否则测出来的会是 GPU 时间而不是 CPU 时间。
-    if (!LoadAndCreateMesh(device, uploadList.Get(), "assets/cube.obj",
-                           m_stressMesh, stagingResources))
+    // M16：用「细分立方体的 LOD 链」取代单一立方体。
+    //
+    // 各级几何被拼进**同一个**顶点/索引缓冲，用 (baseVertex, indexOffset)
+    // 区分 —— 于是间接命令里的三个字段就足以选择几何，
+    // 完全不需要切换缓冲绑定（见 MeshLOD.h 的说明）。
+    if (!CreateLODChain(device, uploadList.Get(), stagingResources))
     {
         return false;
     }
@@ -975,25 +1255,31 @@ bool Renderer::CreateAssets(ID3D12Device* device)
     // VisibleInstanceList：压缩后的可见实例 ID 列表 + 计数器（都是 DEFAULT Heap + UAV）
     if (!m_visibleList.Initialize(device, kMaxInstances, m_srvHeap.Get(),
                                   m_srvDescriptorSize, kVisibilityUavSlot, kVisibleCountUavSlot,
-                                  kVisibleIndicesSrvSlot, kVisibleCountSrvSlot))
+                                  kVisibleIndicesSrvSlot, kVisibleCountSrvSlot,
+                                  m_lodCount)) // M16：按 LOD 分段
     {
         std::cerr << "[Renderer] Failed to create visible instance list.\n";
         return false;
     }
-    if (!m_frustumCuller.Initialize(device, kMaxInstances))
+    if (!m_frustumCuller.Initialize(device, kMaxInstances, m_srvHeap.Get(),
+                                    m_srvDescriptorSize, kInstanceLodUavSlot))
     {
         std::cerr << "[Renderer] Failed to create GPU frustum culler.\n";
         return false;
     }
 
-    // ---- M12：GPU-Driven 渲染所需的间接命令基础设施 ----
-    if (!m_indirectCommands.Initialize(device, kMaxInstances, m_srvHeap.Get(),
-                                       m_srvDescriptorSize, kIndirectArgsUavSlot,
-                                       kVisibleIndicesSrvSlot, kVisibleCountSrvSlot))
+    // ---- M12/M16：GPU-Driven 渲染所需的间接命令基础设施 ----
+    // lodCount = 命令条数（每个 LOD 一条）
+    if (!m_indirectCommands.Initialize(device, kMaxInstances, m_lodCount, m_srvHeap.Get(),
+                                       m_srvDescriptorSize, kIndirectArgsUavSlot))
     {
         std::cerr << "[Renderer] Failed to create indirect draw commands.\n";
         return false;
     }
+
+    // M16：为 per-LOD 索引列表建「每段一个 SRV」。
+    // 顶点着色器因此完全不需要知道 LOD 的存在。
+    CreateLODSegmentSrvs(device, m_visibleList);
 
     uploadList->Close();
     ID3D12CommandList* const lists[] = { uploadList.Get() };
@@ -1276,10 +1562,19 @@ bool Renderer::CreateGpuDrivenPipelineState(ID3D12Device* device)
 
     desc.RasterizerState = MeshRasterizerState();
 
-    // 深度状态必须与 CPU-Driven 的网格 PSO 一致，否则切换模式时画面会变
+    // 深度状态必须与 CPU-Driven 的网格 PSO 一致，否则切换模式时画面会变。
+    //
+    // M13：如果开了 Depth Prepass，这一遍**复用**前面写好的深度 ——
+    //   把深度写入关掉、比较函数放宽成 LESS_EQUAL。
+    //   用 LESS_EQUAL 而不是 LESS 的原因：两遍的 VS 完全相同，深度值逐位一致，
+    //   严格的小于会把自己刚写进去的深度判为失败，整个画面变成空白。
     desc.DepthStencilState.DepthEnable = TRUE;
-    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    desc.DepthStencilState.DepthWriteMask = m_depthPrepassEnabled
+                                                ? D3D12_DEPTH_WRITE_MASK_ZERO
+                                                : D3D12_DEPTH_WRITE_MASK_ALL;
+    desc.DepthStencilState.DepthFunc = m_depthPrepassEnabled
+                                           ? D3D12_COMPARISON_FUNC_LESS_EQUAL
+                                           : D3D12_COMPARISON_FUNC_LESS;
     desc.DepthStencilState.StencilEnable = FALSE;
 
     desc.InputLayout = { inputLayout,
@@ -1294,8 +1589,640 @@ bool Renderer::CreateGpuDrivenPipelineState(ID3D12Device* device)
                                                          IID_PPV_ARGS(&m_gpuDrivenPipelineState)));
 }
 
-void Renderer::RegenerateScene(std::uint32_t instanceCount)
+// ---------------------------------------------------------------------------
+// M13：Depth Prepass PSO（只写深度，不输出颜色）
+//
+// 关键设置：
+//   * NumRenderTargets = 0，RTVFormats[0] = UNKNOWN  ——  完全不绑 RTV。
+//     这样驱动不需要分配任何颜色目标，像素阶段也只做深度测试/写入。
+//   * PS = nullptr  ——  没有像素着色器。深度测试与写入属于**光栅化阶段**的
+//     固定功能，不经过 PS，所以 depth-only 根本不需要它。
+//   * DepthFunc = LESS + WRITE_ALL  ——  这一遍负责把最近表面的深度写进去。
+//
+// 顶点着色器与 GPU-Driven 主路径**完全相同**（同一个 .hlsl、同一套根签名），
+// 因此两遍算出的深度值逐位一致 —— 这是 Main Pass 能用 LESS_EQUAL 通过的前提。
+// ---------------------------------------------------------------------------
+bool Renderer::CreateDepthOnlyPipelineState(ID3D12Device* device)
 {
+    std::string errorMsg;
+    std::vector<std::uint8_t> vsBytecode = ShaderCompiler::Compile(
+        L"MeshGPUDrivenVS.hlsl", L"main", L"vs_6_0", errorMsg);
+    if (vsBytecode.empty())
+    {
+        std::cerr << "[Renderer] Depth-only VS compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+
+    const D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+    // 复用 GPU-Driven 的根签名：两遍的 VS 是同一个，绑定需求完全一致
+    desc.pRootSignature = m_gpuDrivenRootSignature.Get();
+    desc.VS = { vsBytecode.data(), vsBytecode.size() };
+    desc.PS = {}; // 没有像素着色器
+
+    // 不写颜色，所以混合状态无关紧要（保持默认）
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+    desc.SampleMask = UINT_MAX;
+
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    // 背面剔除**必须与 Main Pass 完全一致**（这里复用同一个 MeshRasterizerState）。
+    //
+    // 如果两遍的剔除设置不同，被某一遍剔掉的三角形在另一遍仍然会被光栅化：
+    // 深度缓冲里就会出现没有被 prepass 覆盖的区域 —— 表现为画面上出现
+    // 一阵阵的深度空洞（本该被遮挡的片元因为没写深度而通过了测试）。
+    desc.RasterizerState.CullMode = MeshRasterizerState().CullMode;
+    desc.RasterizerState.FrontCounterClockwise = FALSE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+
+    desc.DepthStencilState.DepthEnable = TRUE;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    desc.DepthStencilState.StencilEnable = FALSE;
+
+    desc.InputLayout = { inputLayout,
+                         static_cast<UINT>(sizeof(inputLayout) / sizeof(inputLayout[0])) };
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+    // -------------------------------------------------------------------------
+    // NumRenderTargets = 0：真正的 depth-only，完全不绑定颜色目标。
+    //
+    // 一度改成过 NumRenderTargets = 1（保留一个 RTV，PS 仍为 null），
+    // 理由是当时测到「无颜色输出」比「有一个 RTV」慢约 3 倍。
+    // **那个读数后来被证实是测量环境问题**（显存吃紧时 GPU 会明显降速）。
+    // 在干净的显存状态下重做 A/B：
+    //
+    //     100k 实例、92 万三角形、RTX 5070，各测 3 次：
+    //       NumRenderTargets = 0  ->  depth 0.524 ms  main 0.810 ms  total 1.333 ms
+    //       NumRenderTargets = 1  ->  depth 0.526 ms  main 0.816 ms  total 1.342 ms
+    //
+    //   两者**没有可测量的差异**，所以这里回到语义更纯粹的写法。
+    //
+    //   > 顺带记下一个方法学教训：GPU 计时对显存压力非常敏感。
+    //   > 两次测量之间必须确认环境一致，否则会得出完全错误的「优化结论」——
+    //   > 这正是本项目在 M13 踩过的坑（详见 docs/BENCHMARKS.md 第 10 节）。
+    // -------------------------------------------------------------------------
+    desc.NumRenderTargets = 0;
+    desc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+    desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    desc.SampleDesc.Count = 1;
+
+    return SUCCEEDED(device->CreateGraphicsPipelineState(&desc,
+                                                         IID_PPV_ARGS(&m_depthOnlyPipelineState)));
+}
+
+// ---------------------------------------------------------------------------
+// M13：深度可视化 PSO
+//
+// 全屏三角形（VS 用 SV_VertexID 现场生成，不需要顶点缓冲）+ 采样深度 SRV。
+// 用**主根签名**（b0 = ObjectConstants，t0 走参数 1 的 SRV 表）——
+// 它本身就是「一个 CBV + 一张 SRV 表」的形状，正好够用。
+// ---------------------------------------------------------------------------
+bool Renderer::CreateDepthVisualizePipelineState(ID3D12Device* device)
+{
+    std::string errorMsg;
+    std::vector<std::uint8_t> vsBytecode = ShaderCompiler::Compile(
+        L"DepthVisualizeVS.hlsl", L"main", L"vs_6_0", errorMsg);
+    if (vsBytecode.empty())
+    {
+        std::cerr << "[Renderer] Depth-visualize VS compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+    std::vector<std::uint8_t> psBytecode = ShaderCompiler::Compile(
+        L"DepthVisualizePS.hlsl", L"main", L"ps_6_0", errorMsg);
+    if (psBytecode.empty())
+    {
+        std::cerr << "[Renderer] Depth-visualize PS compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+    desc.pRootSignature = m_rootSignature.Get();
+    desc.VS = { vsBytecode.data(), vsBytecode.size() };
+    desc.PS = { psBytecode.data(), psBytecode.size() };
+
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.SampleMask = UINT_MAX;
+
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // 全屏三角形没有正反面
+    desc.RasterizerState.FrontCounterClockwise = FALSE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+
+    // 覆盖整个屏幕，所以关闭深度测试
+    desc.DepthStencilState.DepthEnable = FALSE;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    desc.DepthStencilState.StencilEnable = FALSE;
+
+    // 没有顶点缓冲：所有输入由 SV_VertexID 生成
+    desc.InputLayout = { nullptr, 0 };
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    desc.SampleDesc.Count = 1;
+
+    return SUCCEEDED(device->CreateGraphicsPipelineState(
+        &desc, IID_PPV_ARGS(&m_depthVisualizePipelineState)));
+}
+
+// ===========================================================================
+// M14：HZB（Hierarchical Z-Buffer）
+// ===========================================================================
+
+bool Renderer::CreateHZBVisualizePipelineState(ID3D12Device* device)
+{
+    std::string errorMsg;
+    std::vector<std::uint8_t> vsBytecode = ShaderCompiler::Compile(
+        L"DepthVisualizeVS.hlsl", L"main", L"vs_6_0", errorMsg);
+    if (vsBytecode.empty())
+    {
+        std::cerr << "[Renderer] HZB visualize VS compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+    std::vector<std::uint8_t> psBytecode = ShaderCompiler::Compile(
+        L"HZBVisualizePS.hlsl", L"main", L"ps_6_0", errorMsg);
+    if (psBytecode.empty())
+    {
+        std::cerr << "[Renderer] HZB visualize PS compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+
+    // 复用主根签名（b0 = CBV，t0 走参数 1 的 SRV 表，静态采样器 s0）——
+    // 与深度可视化完全相同的形状。
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = {};
+    desc.pRootSignature = m_rootSignature.Get();
+    desc.VS = { vsBytecode.data(), vsBytecode.size() };
+    desc.PS = { psBytecode.data(), psBytecode.size() };
+    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.SampleMask = UINT_MAX;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.RasterizerState.DepthClipEnable = TRUE;
+    desc.DepthStencilState.DepthEnable = FALSE;
+    desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    desc.DepthStencilState.StencilEnable = FALSE;
+    desc.InputLayout = { nullptr, 0 }; // 全屏三角形由 SV_VertexID 生成
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+    desc.SampleDesc.Count = 1;
+
+    return SUCCEEDED(device->CreateGraphicsPipelineState(
+        &desc, IID_PPV_ARGS(&m_hzbVisualizePipelineState)));
+}
+
+void Renderer::RecordHZBBuild()
+{
+    if (!m_hzbEnabled || m_hzb.GetMipCount() == 0)
+    {
+        return;
+    }
+
+    // 深度缓冲这一次要被 CS **读取**（作为 HZB 第 0 级的源），
+    // 所以必须离开 DEPTH_WRITE 状态 —— DSV 与 SRV 是同一资源的两个视图，
+    // 不能在同一次访问里同时使用。
+    TransitionDepthBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    m_hzb.Build(m_commandList.Get(), m_srvHeap.Get(), m_srvDescriptorSize, kDepthSrvSlot);
+
+    // 构建完必须把深度缓冲**转回去**给后续的图形 Pass 用。
+    //
+    // 为什么：HZB 的 CS 把深度当作 SRV 读，所以上面转到了
+    // NON_PIXEL_SHADER_RESOURCE。但 Main Pass 要把它绑定成 **DSV** 做深度测试，
+    // 而 DSV 要求资源处于 DEPTH_WRITE 或 DEPTH_READ ——
+    // 让一个处于 SRV 状态的纹理去当深度附件，是资源状态使用错误。
+    //
+    // 这里用 DEPTH_WRITE 而不是 DEPTH_READ，是因为 Main Pass 的 PSO 里
+    // `DepthWriteMask = ZERO` 已经保证它不会真的写；用 DEPTH_WRITE 可以让
+    // 「prepass 关闭」的路径（那一遍仍然要写深度）复用同一个状态，少一次转换。
+    TransitionDepthBuffer(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
+    // M14：在第 60 帧做一次 HZB 各级深度值的验证读回
+    //（一次性、纯验证；金字塔的生成不依赖它）。
+    if (m_frameCounter >= 60u && !m_hzbVerifyDone)
+    {
+        VerifyHZBLevels();
+    }
+
+    // M16：同一帧再做一次 LOD 分布验证（也是一次性）
+    if (m_frameCounter >= 60u)
+    {
+        VerifyLODDistribution();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M14 验证：读回 HZB 每一级的一个采样值，检查它们是否满足 Max reduction 的
+// 不变量。
+//
+// 要验证的性质：**HZB[i] <= HZB[i+1]**（单调不减）。
+//   理由：第 i+1 级的一个像素覆盖第 i 级的 2x2 区域，
+//         而它是那 4 个值的 max —— 所以一定 >= 其中任何一个。
+//   若这个不等式被破坏，说明归约方向搞错了（用了 Min，或者采样点错位）。
+//
+// 同时检查所有值都落在 [0, 1]：这是传统 D3D 深度约定下 NDC z 的合法范围。
+// 最后一级是 1x1，它的值就是**全屏最远**的深度 —— 可以直接和"场景最远
+// 几何距离"作数量级对照。
+//
+// 注意：这是**一次性调试读回**，只用于验证生成结果；
+// 金字塔本身的生成完全在 GPU 上完成，不依赖任何 CPU 回读。
+// ---------------------------------------------------------------------------
+bool Renderer::CreateHZBVerifyReadback(ID3D12Device* device)
+{
+    // 每一级拷 1 个像素（4 字节），行距按 256 对齐
+    m_hzbVerifyRowPitch = 256;
+    const UINT64 size = static_cast<UINT64>(m_hzbVerifyRowPitch) * HierarchicalZBuffer::kMaxMips;
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    return SUCCEEDED(device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_hzbVerifyReadback)));
+}
+
+void Renderer::VerifyHZBLevels()
+{
+    if (m_hzbVerifyDone || m_hzb.GetMipCount() == 0 || m_hzbVerifyReadback == nullptr)
+    {
+        return;
+    }
+    m_hzbVerifyDone = true;
+
+    // HZB 必须先变成拷贝源
+    // （用独立命令列表做，理由见下面拷贝循环处的说明）
+
+    // 每一级取中心像素（1x1 对齐到 mip 中心），拷到 readback buffer。
+    //
+    // **注意这里必须用一个独立、立即提交的命令列表**：
+    // 本函数是在主命令列表**还在录制**的过程中被调用的，
+    // 如果往那个列表里记录拷贝再去 Signal/Wait，GPU 根本还没收到任何命令 ——
+    // 读回来只会是缓冲区的初值 0（本阶段实际踩到这个坑，第一次读回全 0）。
+    ComPtr<ID3D12CommandAllocator> verifyAllocator;
+    ComPtr<ID3D12GraphicsCommandList> verifyList;
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&verifyAllocator))) ||
+        FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           verifyAllocator.Get(), nullptr,
+                                           IID_PPV_ARGS(&verifyList))))
+    {
+        std::cerr << "[HZB-Verify] failed to create verify command list\n";
+        return;
+    }
+
+    m_hzb.TransitionTo(verifyList.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+    for (UINT mip = 0; mip < m_hzb.GetMipCount(); ++mip)
+    {
+        const UINT w = m_hzb.GetMipWidth(mip);
+        const UINT h = m_hzb.GetMipHeight(mip);
+        const UINT x = w / 2;
+        const UINT y = h / 2;
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = m_hzbVerifyReadback.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = static_cast<UINT64>(mip) * m_hzbVerifyRowPitch;
+        dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+        dst.PlacedFootprint.Footprint.Width = 1;
+        dst.PlacedFootprint.Footprint.Height = 1;
+        dst.PlacedFootprint.Footprint.Depth = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = m_hzbVerifyRowPitch;
+
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = m_hzb.GetResource();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = mip;
+
+        const D3D12_BOX box = { x, y, 0, x + 1, y + 1, 1 };
+        verifyList->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    }
+
+    m_hzb.TransitionTo(verifyList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    verifyList->Close();
+    ID3D12CommandList* lists[] = { verifyList.Get() };
+    m_commandQueue->ExecuteCommandLists(1, lists);
+
+    // 等这一批拷贝完成后再读
+    ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+    if (m_fence->GetCompletedValue() < m_fenceValue)
+    {
+        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+
+    const D3D12_RANGE range = { 0, static_cast<SIZE_T>(m_hzbVerifyRowPitch) *
+                                       m_hzb.GetMipCount() };
+    void* mapped = nullptr;
+    if (FAILED(m_hzbVerifyReadback->Map(0, &range, &mapped)))
+    {
+        std::cerr << "[HZB-Verify] Map failed\n";
+        return;
+    }
+
+    std::cout << "\n===== HZB Depth Value Validation (M14) =====\n";
+    std::cout << "Reduction: MAX (D3D depth, near=0 far=1, larger = farther)\n\n";
+
+    bool monotonic = true;
+    bool inRange = true;
+    float previous = -1.0f;
+    for (UINT mip = 0; mip < m_hzb.GetMipCount(); ++mip)
+    {
+        const float* row = reinterpret_cast<const float*>(
+            static_cast<const std::uint8_t*>(mapped) +
+            static_cast<SIZE_T>(mip) * m_hzbVerifyRowPitch);
+        const float value = row[0];
+
+        if (value < 0.0f || value > 1.0f)
+        {
+            inRange = false;
+        }
+        if (mip > 0 && value < previous - 1e-6f)
+        {
+            monotonic = false;
+        }
+
+        std::printf("  mip %2u  %5ux%-4u  center depth = %.6f%s\n",
+                    mip, m_hzb.GetMipWidth(mip), m_hzb.GetMipHeight(mip), value,
+                    (mip > 0 && value > previous + 1e-6f) ? "   (increased -> Max picked up a farther pixel)" : "");
+        previous = value;
+    }
+
+    m_hzbVerifyReadback->Unmap(0, nullptr);
+
+    std::printf("\n  [1] all values in [0,1]           : %s\n", inRange ? "PASSED" : "FAILED");
+    std::printf("  [2] monotonic non-decreasing      : %s\n",
+                monotonic ? "PASSED (HZB[i] <= HZB[i+1], required by Max reduction)"
+                          : "FAILED (reduction direction is wrong!)");
+    std::printf("  [3] last mip is 1x1 (whole screen): %s\n",
+                (m_hzb.GetMipWidth(m_hzb.GetMipCount() - 1) == 1 &&
+                 m_hzb.GetMipHeight(m_hzb.GetMipCount() - 1) == 1) ? "PASSED" : "FAILED");
+    std::printf("\n  => %s\n\n", (inRange && monotonic) ? "HZB VALIDATION PASSED" : "HZB VALIDATION FAILED");
+}
+
+// ===========================================================================
+// M15：HZB 遮挡剔除
+// ===========================================================================
+
+void Renderer::RecordOcclusionCulling(UINT frameIndexForStats)
+{
+    if (!m_occlusionCuller.IsInitialized() || !m_hzbEnabled || !m_occlusionEnabled)
+    {
+        return;
+    }
+
+    // ---- 资源状态：三者这次都要被 CS **读取** ----
+    //
+    // 1) HZB：平时在 UNORDERED_ACCESS（供自己逐级写入），读之前转到 NON_PIXEL。
+    //    这是同一个资源的「写视图」与「读视图」互斥问题（M13 已经解释过）。
+    m_hzb.TransitionTo(m_commandList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // 2) 候选索引列表与它的计数器：同样要变成 SRV。
+    //    注意上一段（10b 的命令生成）刚把它们当 SRV 用过，所以这里多半是空操作；
+    //    保留调用是为了让本函数单独看也成立。
+    m_visibleList.TransitionIndicesTo(m_commandList.Get(),
+                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_visibleList.TransitionCountTo(m_commandList.Get(),
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // ---- 相机参数 ----
+    //
+    // proj00 / proj11 用来把世界空间半径换算成 NDC 半径。
+    // 直接从投影矩阵取，避免再手写一套 FOV / aspect 的推导而与相机脱节。
+    const XMMATRIX view = m_camera.GetView();
+    const XMMATRIX projection = m_camera.GetProjection();
+    const XMMATRIX viewProj = XMMatrixMultiply(view, projection);
+
+    XMFLOAT4X4 viewProjFloat4x4;
+    XMStoreFloat4x4(&viewProjFloat4x4, viewProj);
+
+    const float proj00 = projection.r[0].m128_f32[0];
+    const float proj11 = projection.r[1].m128_f32[1];
+
+    m_occlusionCuller.Record(
+        m_commandList.Get(), m_device.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
+        m_visibleList,
+        m_instanceBuffer.GetResource(),
+        m_hzb.GetResource(),
+        m_hzb.GetMipCount(),
+        m_hzb.GetMipWidth(0), m_hzb.GetMipHeight(0),
+        viewProjFloat4x4, proj00, proj11,
+        m_width, m_height, m_nearPlane, m_farPlane,
+        m_occlusionDepthBias);
+
+    // 统计拷进 readback 的环形缓冲（CPU 会在若干帧之后无阻塞地读它）
+    m_occlusionCuller.ResolveStats(m_commandList.Get(), frameIndexForStats);
+
+    // HZB 转回可写，供下一帧的 Build 使用
+    m_hzb.TransitionTo(m_commandList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+void Renderer::RecordHZBVisualization()
+{
+    if (m_hzbVisualizePipelineState == nullptr || m_hzb.GetMipCount() == 0)
+    {
+        return;
+    }
+
+    // 要查看哪一级由常量缓冲给出（见 Render() 里的 kHZBVisualizeConstantSlot），
+    // Shader 用 SampleLevel 显式采样那一级。
+
+    // HZB 从「CS 可写」切到「像素着色器可读」。
+    // 注意这里**不需要**再插 UAV barrier：Build() 结尾已经插过一次。
+    m_hzb.TransitionTo(m_commandList.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtvHandle.ptr += static_cast<SIZE_T>(m_swapChain->GetCurrentBackBufferIndex()) *
+                     m_rtvDescriptorSize;
+    m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+
+    m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+    m_commandList->SetPipelineState(m_hzbVisualizePipelineState.Get());
+
+    m_commandList->SetGraphicsRootConstantBufferView(
+        0, m_frames[m_frameIndex].constantBuffer.GetGPUVirtualAddress() +
+               static_cast<UINT64>(kHZBVisualizeConstantSlot) * kConstantStride);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE hzbSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    hzbSrv.ptr += static_cast<UINT64>(kHZBSrvSlot) * m_srvDescriptorSize;
+    m_commandList->SetGraphicsRootDescriptorTable(1, hzbSrv);
+
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_commandList->DrawInstanced(3, 1, 0, 0);
+
+    // 切回 UAV，让下一帧的 Build() 可以直接继续写（省掉一次转换）。
+    m_hzb.TransitionTo(m_commandList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+void Renderer::TransitionDepthBuffer(D3D12_RESOURCE_STATES newState)
+{
+    if (m_depthState == newState || m_depthBuffer == nullptr)
+    {
+        return;
+    }
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = m_depthBuffer.Get();
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = m_depthState;
+    barrier.Transition.StateAfter = newState;
+    m_commandList->ResourceBarrier(1, &barrier);
+
+    m_depthState = newState;
+}
+
+void Renderer::RecordDepthPrepass()
+{
+    // =========================================================================
+    // Depth Prepass：只写深度、不输出颜色的一遍。
+    //
+    // 它复用 M12 建立的间接命令与压缩列表 —— 也就是说这一遍**同样**
+    // 只提交一次 ExecuteIndirect，画多少个实例由 GPU 的可见数决定。
+    // 换的只是 PSO：depth-only（无 PS、无 RTV）。
+    //
+    // 为什么值得单独一遍（详见 LEARNING_NOTES M13）：
+    //   主 Pass 的像素着色器（纹理采样 + 光照）成本远高于深度测试。
+    //   先跑一遍廉价的纯深度，主 Pass 就能靠 Early-Z 在**像素着色之前**
+    //   丢弃被遮挡的片元 —— 用一份额外的几何开销换掉大量的像素开销。
+    // =========================================================================
+    if (m_depthOnlyPipelineState == nullptr)
+    {
+        return;
+    }
+
+    // ---- 1. 时间戳：Depth Pass 开始时 ----
+    //   注意 EndQuery 记录的是「GPU 执行到这一点的时刻」，不是 CPU 发起时刻。
+    // ---- 2. 深度缓冲必须可写（若上一帧末为了可视化把它转成了 SRV，这里要转回来）----
+    TransitionDepthBuffer(D3D12_RESOURCE_STATE_DEPTH_WRITE);
+
+    // ---- 3. 清深度 ----
+    //   两个 Pass 共用同一个深度缓冲，所以清屏只在这里做一次。
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    m_commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+    // ---- 4. 绑定 depth-only PSO 与**全部根参数** ----
+    //
+    // 注意：prepass 的 PSO 复用 GPU-Driven 的根签名（两遍的 VS 是同一个），
+    // 所以必须像主 Pass 一样把三个根参数都绑好 —— 包括实例数据与可见索引。
+    // 漏绑任何一个是未定义行为（驱动会沿用上一次的绑定，或读到无效描述符），
+    // 表现为设备移除且没有任何可读的错误信息。
+    m_commandList->SetGraphicsRootSignature(m_gpuDrivenRootSignature.Get());
+    m_commandList->SetPipelineState(m_depthOnlyPipelineState.Get());
+
+    m_commandList->SetGraphicsRootConstantBufferView(
+        0, m_frames[m_frameIndex].constantBuffer.GetGPUVirtualAddress() +
+               static_cast<UINT64>(kGlobalConstantSlot) * kConstantStride);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE instanceSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    instanceSrv.ptr += static_cast<UINT64>(kInstanceSrvSlot) * m_srvDescriptorSize;
+    m_commandList->SetGraphicsRootDescriptorTable(1, instanceSrv);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE visibleSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    visibleSrv.ptr += static_cast<UINT64>(kVisibleIndicesSrvSlot) * m_srvDescriptorSize;
+    m_commandList->SetGraphicsRootDescriptorTable(2, visibleSrv);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE materialSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    materialSrv.ptr += static_cast<UINT64>(m_stressMaterial.srvIndex) * m_srvDescriptorSize;
+    m_commandList->SetGraphicsRootDescriptorTable(3, materialSrv);
+
+    // 几何数据
+    const D3D12_VERTEX_BUFFER_VIEW& vertexBufferView = m_stressMesh.GetVertexBufferView();
+    const D3D12_INDEX_BUFFER_VIEW& indexBufferView = m_stressMesh.GetIndexBufferView();
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    m_commandList->IASetVertexBuffers(0, 1, &vertexBufferView);
+    m_commandList->IASetIndexBuffer(&indexBufferView);
+
+    // 不绑 RTV：必须与 PSO 的 NumRenderTargets = 0 一致 ——
+    // depth-only 不需要颜色目标，OMSetRenderTargets 的数量传 0。
+    m_commandList->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
+
+    // ---- 5. **每个 LOD 一次 ExecuteIndirect** ----
+    //
+    // 每条命令带自己的几何偏移（StartIndex / BaseVertex）与自己的实例数，
+    // 所以这里必须逐级提交 —— ExecuteIndirect 一次只能表达「从第几条开始、
+    // 连续几条命令」，而我们的命令确实就是连续排列的（第 lod 条在 lod*20）。
+    //
+    // 换段 SRV 的原因：顶点着色器的 SV_InstanceID 在每次 draw 内从 0 开始，
+    // 而每条命令的 instanceCount 只是**该级**的数量，所以 SRV 必须指向该段的起点
+    // （见 CreateLODSegmentSrvs 的说明）。
+    for (std::uint32_t lod = 0; lod < m_lodCount; ++lod)
+    {
+        D3D12_GPU_DESCRIPTOR_HANDLE segSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+        segSrv.ptr += static_cast<UINT64>(kLODSegmentSrvSlot + lod) * m_srvDescriptorSize;
+        m_commandList->SetGraphicsRootDescriptorTable(2, segSrv);
+
+        m_commandList->ExecuteIndirect(
+            m_indirectCommands.GetCommandSignature(),
+            1, // 每次只提交这一级的命令
+            m_indirectCommands.GetArgumentBuffer(),
+            static_cast<UINT64>(lod) * IndirectDrawCommands::kDrawIndexedArgumentSize,
+            nullptr, 0);
+    }
+
+    // ---- 6. 时间戳：Depth Pass 结束 ----
+    m_gpuProfiler.WriteTimestamp(m_commandList.Get(), m_frameIndex,
+                               GPUProfiler::kSlotDepthEnd);
+}
+
+void Renderer::RecordDepthVisualization()
+{
+    if (m_depthVisualizePipelineState == nullptr || m_depthBuffer == nullptr)
+    {
+        return;
+    }
+
+    // 深度缓冲这次要作为**纹理**被采样，必须离开 DEPTH_WRITE 状态。
+    // DSV 与 SRV 是同一个资源的两个视图，不能在同一次访问里同时使用。
+    TransitionDepthBuffer(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle =
+        m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtvHandle.ptr += static_cast<SIZE_T>(m_swapChain->GetCurrentBackBufferIndex()) *
+                     m_rtvDescriptorSize;
+    m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+
+    m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+    m_commandList->SetPipelineState(m_depthVisualizePipelineState.Get());
+
+    // 根参数 0：CBV（放 near/far 与 1/分辨率）
+    m_commandList->SetGraphicsRootConstantBufferView(
+        0, m_frames[m_frameIndex].constantBuffer.GetGPUVirtualAddress() +
+               static_cast<UINT64>(kDepthVisualizeConstantSlot) * kConstantStride);
+
+    // 根参数 1：SRV 表 -> 深度纹理
+    D3D12_GPU_DESCRIPTOR_HANDLE depthSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    depthSrv.ptr += static_cast<UINT64>(kDepthSrvSlot) * m_srvDescriptorSize;
+    m_commandList->SetGraphicsRootDescriptorTable(1, depthSrv);
+
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    // 全屏三角形：3 个顶点，没有顶点缓冲
+    m_commandList->DrawInstanced(3, 1, 0, 0);
+}
+
+void Renderer::RegenerateScene(std::uint32_t instanceCount){
     // 切换规模会立刻改变提交数量与常量缓冲内容，先确保 GPU 已经读完上一批数据。
     WaitForGpu();
 
@@ -1435,9 +2362,15 @@ void Renderer::CompareGpuAndCpuCulling()
 
     ID3D12DescriptorHeap* const heaps[] = { m_srvHeap.Get() };
     list->SetDescriptorHeaps(1, heaps);
+
+    // 这条验证路径与 CPU 侧的视锥剔除逐实例对比，所以必须让 GPU 也只做**视锥**
+    // 剔除 —— 把 LOD 强制成 1 级（lodBias = -1 等价于永远选 LOD0），
+    // 否则输出列表会被 LOD 分段打散，两边无法直接比对。
+    const XMFLOAT4X4 identityViewProj = {};
     m_frustumCuller.Record(list.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
-                           kInstanceSrvSlot, m_visibleList,
-                           m_lastFrustumPlanes, instanceCount);
+                           kInstanceSrvSlot, kLODMetadataSrvSlot, m_visibleList,
+                           m_lastFrustumPlanes, identityViewProj, 0.0f, -1.0f, 1u,
+                           instanceCount);
     list->Close();
 
     ID3D12CommandList* const lists[] = { list.Get() };
@@ -1457,21 +2390,25 @@ void Renderer::CompareGpuAndCpuCulling()
                                        m_visibleList,
                                        m_visibleIndices, instanceCount);
 
-    // 临时诊断：此刻 GPU 已经执行过若干帧，参数缓冲里应当有真实内容。
+    // 顺带读回间接命令的前几条，确认 GPU 写出的命令内容与预期一致
+    // （InstanceCount 应当等于 GPU 算出的可见数、StartInstanceLocation 为 0）。
+    // 这是 --compare-cull / G 键验证流程的一部分，不是临时调试代码。
+    constexpr UINT kCommandsToDump = 4;
     m_indirectCommands.DebugReadbackFirstCommands(
         m_device.Get(), m_commandQueue.Get(), m_fence.Get(), m_fenceEvent,
-        m_fenceValue, 4);
+        m_fenceValue, kCommandsToDump);
 }
 
-void Renderer::RecordGpuDrivenDraw(UINT indexCount, std::uint32_t visibleCount)
+void Renderer::RecordGpuDrivenDraw(std::uint32_t visibleCount, UINT segmentSrvBaseSlot,
+                                   std::uint32_t lodCount)
 {
-    // visibleCount 在本版里不再参与提交 —— ExecuteIndirect 的命令条数恒为 1，
-    // 而「画多少个实例」由 GPU 写进间接命令的 InstanceCount 决定。
+    // visibleCount 不再参与提交 —— 每条命令的 InstanceCount 由 GPU 写入。
     // 参数保留是为了给调用方一个明确的语义：CPU **知道**可见数，但**不用**它。
     (void)visibleCount;
 
     // =========================================================================
-    // GPU-Driven 的绘制记录：整段只有**一次** ExecuteIndirect，没有任何逐实例循环。
+    // GPU-Driven 的绘制记录：整段只有 N 次（N = LOD 级数）ExecuteIndirect，
+    // 没有任何逐实例循环。
     // =========================================================================
     // 1. 绑定 GPU-Driven 专用的根签名与 PSO。
     m_commandList->SetGraphicsRootSignature(m_gpuDrivenRootSignature.Get());
@@ -1497,12 +2434,11 @@ void Renderer::RecordGpuDrivenDraw(UINT indexCount, std::uint32_t visibleCount)
     instanceSrv.ptr += static_cast<UINT64>(kInstanceSrvSlot) * m_srvDescriptorSize;
     m_commandList->SetGraphicsRootDescriptorTable(1, instanceSrv);
 
-    // 压缩后的可见实例索引（M11 产出）：顶点着色器用它把 SV_InstanceID
-    // 换算成真正的实例 ID。
-    D3D12_GPU_DESCRIPTOR_HANDLE visibleSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
-    visibleSrv.ptr += static_cast<UINT64>(kVisibleIndicesSrvSlot) * m_srvDescriptorSize;
-    m_commandList->SetGraphicsRootDescriptorTable(2, visibleSrv);
-
+    // 要绘制的实例索引列表（顶点着色器用它把 SV_InstanceID 换算成真正的实例 ID）。
+    //
+    // M16 起这个列表是**按 LOD 分段**的，每段一个 SRV（见 CreateLODSegmentSrvs）。
+    // 段 SRV 在下面的提交循环里逐级切换 —— 因为每条命令的 instanceCount
+    // 只是该级的数量，而 SV_InstanceID 在每次 draw 内从 0 开始。
     D3D12_GPU_DESCRIPTOR_HANDLE materialSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
     materialSrv.ptr += static_cast<UINT64>(m_stressMaterial.srvIndex) * m_srvDescriptorSize;
     m_commandList->SetGraphicsRootDescriptorTable(3, materialSrv);
@@ -1512,36 +2448,524 @@ void Renderer::RecordGpuDrivenDraw(UINT indexCount, std::uint32_t visibleCount)
     //    ExecuteIndirect 要求参数缓冲处于 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT ——
     //    它告诉驱动这块内存接下来由**命令处理器**读取，而不是被着色器读写。
     //    用错状态会读到陈旧的命令（驱动会认为不需要刷新相关缓存）。
+    //
+    //    注意：Depth Prepass 已经提前把它转到 INDIRECT_ARGUMENT 了，
+    //    这里的调用是同状态空操作 —— 保留它是为了让本函数单独看也成立。
     m_indirectCommands.TransitionTo(m_commandList.Get(),
                                     D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
 
-    // 5. 可见索引列表在这次绘制里被**顶点着色器**读取，所以要转到
-    //    NON_PIXEL_SHADER_RESOURCE（顶点阶段属于 non-pixel）。
-    m_visibleList.TransitionIndicesTo(m_commandList.Get(),
-                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    m_visibleList.TransitionCountTo(m_commandList.Get(),
-                                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-
-    // 6. **一次 ExecuteIndirect 提交 1 条命令**，而这条命令的 InstanceCount
-    //    是 GPU 写进去的可见数 —— 于是「画多少个实例」完全由 GPU 决定。
+    // 5. **每个 LOD 一次 ExecuteIndirect**。
     //
-    //    MaxCommandCount = 1 是编译期常数：无论场景有多少实例、可见多少，
-    //    CPU 提交的命令条数**永远是 1**。这就是 GPU-Driven 的实质。
-    m_commandList->ExecuteIndirect(
-        m_indirectCommands.GetCommandSignature(),
-        1,                                         // 永远只有一条命令
-        m_indirectCommands.GetArgumentBuffer(), 0,
-        nullptr, 0);                               // 条数不来自 count buffer
+    //    每条命令的 InstanceCount 都是 GPU 写进去的（该级的实例数），
+    //    所以「画多少个实例」仍然完全由 GPU 决定；CPU 只决定「提交几条」，
+    //    而那个数量就是 LOD 级数 —— 一个编译期常数。
+    //
+    //    M16 相对 M12 的退让：命令条数从常数 1 变成常数 N（N = LOD 级数）。
+    //    这是「按实例选不同几何」无法回避的代价 —— 几何选择只能表达在命令里。
+    for (std::uint32_t lod = 0; lod < lodCount; ++lod)
+    {
+        D3D12_GPU_DESCRIPTOR_HANDLE segSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+        segSrv.ptr += static_cast<UINT64>(segmentSrvBaseSlot + lod) * m_srvDescriptorSize;
+        m_commandList->SetGraphicsRootDescriptorTable(2, segSrv);
 
-    // 7. 转回 UNORDERED_ACCESS，让下一帧的命令生成 CS 可以直接继续写。
+        m_commandList->ExecuteIndirect(
+            m_indirectCommands.GetCommandSignature(),
+            1, // 只提交这一级的命令
+            m_indirectCommands.GetArgumentBuffer(),
+            static_cast<UINT64>(lod) * IndirectDrawCommands::kDrawIndexedArgumentSize,
+            nullptr, 0);
+    }
+
+    // 6. 转回 UNORDERED_ACCESS，让下一帧的命令生成 CS 可以直接继续写。
     m_indirectCommands.TransitionTo(m_commandList.Get(),
                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-
-    (void)indexCount;
 }
 
-void Renderer::HandleKey(UINT virtualKey){
+// ---------------------------------------------------------------------------
+// M15：遮挡剔除可视化 —— 计算「被 HZB 遮挡剔除」的实例集合
+//
+// 做法：**用 CPU 侧已有的视锥内集合作差**，不新增任何 GPU 资源 ——
+//   候选（视锥内）= CPU 自己的剔除结果 m_visibleIndices（M10 已验证与 GPU 一致）
+//   最终可见      = GPU 遮挡剔除输出的列表（延迟读回）
+//   被遮挡剔除    = 前者 − 后者
+//
+// 读回是**独立提交 + 立即等待**的一次性拷贝。这不是每帧同步：
+// 它只在可视化开启时执行，而且拷贝量有上限（kMaxReadback）。
+// 正常运行时（K 关闭）这条路径完全不参与。
+//
+// 结果存进 m_occlusionDebugVisible（排序后的可见索引），
+// 真正的画线由 UpdateDebugLines 里的双指针循环完成 —— 与视锥可视化共用一套遍历。
+// ---------------------------------------------------------------------------
+void Renderer::BuildOcclusionDebugLines()
+{
+    m_occlusionDebugVisible.clear();
+
+    if (!m_occlusionVisualize || !m_occlusionEnabled || !m_occlusionCuller.IsInitialized())
+    {
+        return;
+    }
+
+    VisibleInstanceList& visibleList = m_occlusionCuller.GetVisibleList();
+    if (m_occlusionDebugReadback == nullptr || visibleList.GetIndexBuffer() == nullptr)
+    {
+        return;
+    }
+
+    constexpr UINT kMaxReadback = 8192; // 只画前若干个，读回量可控
+    const std::uint32_t capacity = visibleList.GetCapacity();
+    const UINT copyCount = (capacity < kMaxReadback) ? capacity : kMaxReadback;
+
+    // 主命令列表此刻还在录制中，所以这里必须用独立且立即提交的命令列表
+    // （M14 的 HZB 验证踩过这个坑：往未提交的列表里记录拷贝再等待，读到的是初值）。
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&allocator))) ||
+        FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           allocator.Get(), nullptr, IID_PPV_ARGS(&list))))
+    {
+        return;
+    }
+
+    list->CopyBufferRegion(m_occlusionDebugReadback.Get(), 0,
+                           visibleList.GetIndexBuffer(), 0,
+                           static_cast<UINT64>(copyCount) * sizeof(std::uint32_t));
+    list->Close();
+
+    ID3D12CommandList* lists[] = { list.Get() };
+    m_commandQueue->ExecuteCommandLists(1, lists);
+
+    ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+    if (m_fence->GetCompletedValue() < m_fenceValue)
+    {
+        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+
+    const D3D12_RANGE range = { 0, static_cast<SIZE_T>(copyCount) * sizeof(std::uint32_t) };
+    void* mapped = nullptr;
+    if (FAILED(m_occlusionDebugReadback->Map(0, &range, &mapped)))
+    {
+        return;
+    }
+
+    const std::uint32_t* values = reinterpret_cast<const std::uint32_t*>(mapped);
+    m_occlusionDebugVisible.assign(values, values + copyCount);
+    m_occlusionDebugReadback->Unmap(0, nullptr);
+
+    // 排序后就能像视锥可视化那样用双指针判断成员关系，避免每帧建哈希集合
+    std::sort(m_occlusionDebugVisible.begin(), m_occlusionDebugVisible.end());
+}
+
+bool Renderer::CreateOcclusionDebugReadback(ID3D12Device* device)
+{
+    // 读回 GPU 可见列表的前若干项，用于遮挡剔除可视化
+    constexpr UINT kMaxReadback = 8192;
+    const UINT64 size = static_cast<UINT64>(kMaxReadback) * sizeof(std::uint32_t);
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    return SUCCEEDED(device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&m_occlusionDebugReadback)));
+}
+
+// ===========================================================================
+// M16：GPU-Driven LOD
+// ===========================================================================
+
+bool Renderer::CreateLODChain(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
+                              std::vector<ComPtr<ID3D12Resource>>& stagingOut)
+{
+    // -------------------------------------------------------------------------
+    // 1. 生成 LOD 链几何
+    //
+    // 4 级细分立方体，每面细分数从 8 降到 1。所有级别的顶点与索引被**拼接**
+    // 进同一个 MeshData —— 这样一次上传就能覆盖全部级别（见 MeshLOD.h）。
+    // -------------------------------------------------------------------------
+    const std::vector<std::uint32_t> segmentsPerLevel = { 8u, 4u, 2u, 1u };
+
+    // 屏幕尺寸阈值：包围球投影直径占屏幕高度的比例。
+    //
+    //   >= 0.20          -> LOD0（每面 8x8，768 tri）
+    //   [0.07, 0.20)     -> LOD1（4x4，192 tri）
+    //   [0.025, 0.07)    -> LOD2（2x2，48 tri）
+    //   < 0.025          -> LOD3（1x1，12 tri）
+    //
+    // 用「占屏幕比例」而不是像素数：阈值与分辨率无关。
+    // 用「投影尺寸」而不是世界距离：阈值与 FOV 无关（详见 LEARNING_NOTES M16 Q1）。
+    const std::vector<float> thresholds = { 0.20f, 0.07f, 0.025f };
+
+    MeshData lodData = BuildSubdividedCubeLODChain(segmentsPerLevel, thresholds, m_lodRanges);
+    m_lodCount = static_cast<std::uint32_t>(m_lodRanges.size());
+
+    if (!m_stressMesh.Initialize(device, cmd, lodData, stagingOut))
+    {
+        std::cerr << "[Renderer] Failed to create LOD chain mesh.\n";
+        return false;
+    }
+
+    std::cout << "[Renderer] LOD chain: " << m_lodCount << " levels, "
+              << lodData.vertices.size() << " vertices / " << lodData.indices.size()
+              << " indices total\n";
+    for (std::uint32_t i = 0; i < m_lodCount; ++i)
+    {
+        std::cout << "        LOD" << i << ": indexOffset=" << m_lodRanges[i].indexOffset
+                  << " indexCount=" << m_lodRanges[i].indexCount
+                  << " baseVertex=" << m_lodRanges[i].baseVertex
+                  << " tris=" << m_lodRanges[i].triangleCount
+                  << " threshold=" << m_lodRanges[i].screenSizeThreshold << "\n";
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. 把 LOD 元数据上传到 GPU（StructuredBuffer<MeshLODRange>，stride 32）
+    //
+    // 它必须常驻显存：剔除 CS 每帧都要读它来算「该用哪一级」，
+    // 而 CPU 每帧都不能参与 —— 这正是「LOD Selection 在 GPU 完成」的前提。
+    // -------------------------------------------------------------------------
+    const UINT64 metadataBytes = static_cast<UINT64>(m_lodRanges.size()) * sizeof(MeshLODRange);
+
+    D3D12_HEAP_PROPERTIES uploadHeap = {};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC bufferDesc = {};
+    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDesc.Width = metadataBytes;
+    bufferDesc.Height = 1;
+    bufferDesc.DepthOrArraySize = 1;
+    bufferDesc.MipLevels = 1;
+    bufferDesc.SampleDesc.Count = 1;
+    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ComPtr<ID3D12Resource> staging;
+    if (FAILED(device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               IID_PPV_ARGS(&staging))))
+    {
+        std::cerr << "[Renderer] Failed to create LOD metadata staging buffer.\n";
+        return false;
+    }
+
+    {
+        void* mapped = nullptr;
+        if (FAILED(staging->Map(0, nullptr, &mapped)))
+        {
+            return false;
+        }
+        std::memcpy(mapped, m_lodRanges.data(), static_cast<std::size_t>(metadataBytes));
+        staging->Unmap(0, nullptr);
+    }
+
+    D3D12_HEAP_PROPERTIES defaultHeap = {};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    // Buffer 的 InitialState 会被运行时忽略，一律写 COMMON，
+    // 然后用显式 barrier 转到 COPY_DEST（否则 Debug Layer 报 ID=1328）。
+    if (FAILED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                                               D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               IID_PPV_ARGS(&m_lodMetadataBuffer))))
+    {
+        std::cerr << "[Renderer] Failed to create LOD metadata buffer.\n";
+        return false;
+    }
+
+    {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = m_lodMetadataBuffer.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        cmd->ResourceBarrier(1, &barrier);
+    }
+
+    cmd->CopyBufferRegion(m_lodMetadataBuffer.Get(), 0, staging.Get(), 0, metadataBytes);
+
+    {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = m_lodMetadataBuffer.Get();
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        cmd->ResourceBarrier(1, &barrier);
+    }
+
+    // staging 必须活到 GPU 执行完这批上传命令之后
+    stagingOut.push_back(staging);
+
+    // SRV：StructuredBuffer<MeshLODRange>
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_UNKNOWN; // StructuredBuffer 必须用 UNKNOWN
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Buffer.FirstElement = 0;
+    srvDesc.Buffer.NumElements = m_lodCount;
+    srvDesc.Buffer.StructureByteStride = sizeof(MeshLODRange);
+    srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    handle.ptr += static_cast<SIZE_T>(kLODMetadataSrvSlot) * m_srvDescriptorSize;
+    device->CreateShaderResourceView(m_lodMetadataBuffer.Get(), &srvDesc, handle);
+
+    return true;
+}
+
+void Renderer::CreateLODSegmentSrvs(ID3D12Device* device, VisibleInstanceList& list)
+{
+    // 为 per-LOD 索引列表的每一段建一个 SRV。
+    //
+    // 关键：顶点着色器用 SV_InstanceID（0..instanceCount-1）索引 SRV，
+    // 而每条命令的 instanceCount 只是**该级**的数量。所以 SRV 的
+    // FirstElement 必须指向该段的起点，SV_InstanceID 才能正确落在段内。
+    //
+    // 这样做的好处是**顶点着色器完全不需要知道 LOD 的存在** ——
+    // 它看到的永远是一个从 0 开始的紧凑列表，与 M12 的行为一致。
+    for (std::uint32_t lod = 0; lod < m_lodCount; ++lod)
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Buffer.FirstElement = list.GetSegmentOffset(lod);
+        srvDesc.Buffer.NumElements = list.GetCapacity();
+        srvDesc.Buffer.StructureByteStride = sizeof(std::uint32_t);
+        srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE handle = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        handle.ptr += static_cast<SIZE_T>(kLODSegmentSrvSlot + lod) * m_srvDescriptorSize;
+        device->CreateShaderResourceView(list.GetIndexBuffer(), &srvDesc, handle);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M16 验证：读回 per-LOD 的实例计数器，确认 LOD 选择真的在 GPU 上按尺寸发生了。
+//
+// 这一次性读回是**唯一**能证明「LOD 在切换」的手段 —— 光看画面无法区分
+// 「几何变粗了」和「本来就长这样」。
+//
+// 同时给出「实际渲染三角形数」，这是本阶段要统计的核心指标：
+//     renderedTris = Σ lodCounts[lod] × lodRanges[lod].triangleCount
+// 它直接反映 LOD 的价值 —— 如果 LOD 全部落在 0 级，三角形数会远高于预期。
+// ---------------------------------------------------------------------------
+void Renderer::VerifyLODDistribution()
+{
+    if (m_lodVerifyDone || m_lodCount == 0 || m_occlusionDebugReadback == nullptr)
+    {
+        return;
+    }
+    // 只有「GPU-Driven 且遮挡剔除关闭」时 LOD 才真正生效
+    //（否则 lodCount 会被强制成 1，per-LOD 计数器里只有第 0 段有意义）。
+    // 在别的模式下验证不仅无意义，而且计数器压根没被写过。
+    if (m_renderMode != RenderMode::GpuDriven || m_occlusionEnabled)
+    {
+        m_lodVerifyDone = true;
+        return;
+    }
+    m_lodVerifyDone = true;
+
+    // 计数器缓冲是 DEFAULT heap + UAV，先转到 COPY_SOURCE 再拷进 readback。
+    // 这里用独立且立即提交的命令列表（主列表此刻还在录制中）。
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&allocator))) ||
+        FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           allocator.Get(), nullptr, IID_PPV_ARGS(&list))))
+    {
+        return;
+    }
+
+    m_visibleList.TransitionCountTo(list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+    const UINT countBytes = m_lodCount * static_cast<UINT>(sizeof(std::uint32_t));
+    list->CopyBufferRegion(m_occlusionDebugReadback.Get(), 0,
+                           m_visibleList.GetCountBuffer(), 0, countBytes);
+    m_visibleList.TransitionCountTo(list.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->Close();
+
+    ID3D12CommandList* lists[] = { list.Get() };
+    m_commandQueue->ExecuteCommandLists(1, lists);
+
+    ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+    if (m_fence->GetCompletedValue() < m_fenceValue)
+    {
+        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+
+    const D3D12_RANGE range = { 0, countBytes };
+    void* mapped = nullptr;
+    if (FAILED(m_occlusionDebugReadback->Map(0, &range, &mapped)))
+    {
+        return;
+    }
+    const std::uint32_t* counts = reinterpret_cast<const std::uint32_t*>(mapped);
+
+    std::uint64_t renderedTriangles = 0;
+    std::uint32_t totalInstances = 0;
+    std::cout << "\n===== GPU LOD Selection Validation (M16) =====\n";
+    std::cout << "LOD levels: " << m_lodCount
+              << "  (selection performed entirely on the GPU)\n\n";
+
+    for (std::uint32_t lod = 0; lod < m_lodCount; ++lod)
+    {
+        const std::uint32_t count = counts[lod];
+        const std::uint32_t tris = m_lodRanges[lod].triangleCount;
+        renderedTriangles += static_cast<std::uint64_t>(count) * tris;
+        totalInstances += count;
+
+        std::printf("  LOD%u  instances=%6u  tris/instance=%4u  -> %8llu tris   "
+                    "(screen size >= %.4f)\n",
+                    lod, count, tris,
+                    static_cast<unsigned long long>(count) * tris,
+                    m_lodRanges[lod].screenSizeThreshold);
+    }
+
+    // 如果全部落在 LOD0，说明尺寸判据没有生效 —— 这是个强判据
+    const bool distributed = (counts[0] < totalInstances) || (m_lodCount == 1);
+    const std::uint64_t naiveTriangles =
+        static_cast<std::uint64_t>(totalInstances) * m_lodRanges[0].triangleCount;
+
+    std::printf("\n  total instances (frustum-visible) : %u\n", totalInstances);
+    std::printf("  rendered triangles (with LOD)     : %llu\n",
+                static_cast<unsigned long long>(renderedTriangles));
+    std::printf("  triangles if all LOD0             : %llu\n",
+                static_cast<unsigned long long>(naiveTriangles));
+    if (naiveTriangles > 0)
+    {
+        std::printf("  triangle reduction from LOD       : %.1f%%\n",
+                    100.0 * (1.0 - static_cast<double>(renderedTriangles) /
+                                       static_cast<double>(naiveTriangles)));
+    }
+    std::printf("\n  [1] LOD selection distributed across levels : %s\n",
+                distributed ? "PASSED" : "FAILED (everything is LOD0 - size test not working)");
+    std::printf("\n  => %s\n\n", distributed ? "LOD VALIDATION PASSED" : "LOD VALIDATION FAILED");
+
+    m_lodTriangleBudget = static_cast<std::uint32_t>(renderedTriangles);
+    // 同时缓存每级数量供屏幕统计使用（避免每帧再读一次 GPU）
+    for (std::uint32_t lod = 0; lod < 8u; ++lod)
+    {
+        m_lodCounts[lod] = (lod < m_lodCount) ? counts[lod] : 0u;
+    }
+
+    m_occlusionDebugReadback->Unmap(0, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// M16 可视化：把每实例的 LOD 读回 CPU，供调试视图按级着色。
+//
+// 这是**延迟 + 低频**的：只在 debug viz 打开时、每 30 帧读一次，
+// 而且读回量按实例数上限截断。理由与 M15 的可视化一致 ——
+// 调试可视化可以有一点滞后，但不能每帧打断 GPU 流水线。
+//
+// 着色约定（任务要求）：
+//     LOD0 = 红   LOD1 = 黄   LOD2 = 绿   LOD3 = 蓝
+// ---------------------------------------------------------------------------
+void Renderer::ReadbackInstanceLOD()
+{
+    if (m_debugViewMode <= 0 || !m_lodEnabled || m_lodCount <= 1)
+    {
+        return;
+    }
+    // 与 VerifyLODDistribution 同样的前提：LOD 只在 GPU-Driven 且无遮挡剔除时生效
+    if (m_renderMode != RenderMode::GpuDriven || m_occlusionEnabled)
+    {
+        return;
+    }
+
+    // 每 30 帧读一次就足够看清切换（LOD 变化本来就是低频事件）
+    if ((m_lodReadbackCounter++ % 30u) != 0u)
+    {
+        return;
+    }
+
+    ID3D12Resource* lodBuffer = m_frustumCuller.GetInstanceLODBuffer();
+    if (lodBuffer == nullptr || m_occlusionDebugReadback == nullptr)
+    {
+        return;
+    }
+
+    // readback 缓冲是 8192 个 uint，所以最多读这么多实例
+    constexpr UINT kMaxLODReadback = 8192;
+    const UINT instanceCount = m_instanceBuffer.GetInstanceCount();
+    const UINT copyCount = (instanceCount < kMaxLODReadback) ? instanceCount : kMaxLODReadback;
+    if (copyCount == 0)
+    {
+        return;
+    }
+
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&allocator))) ||
+        FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           allocator.Get(), nullptr, IID_PPV_ARGS(&list))))
+    {
+        return;
+    }
+
+    // 该缓冲常驻 UNORDERED_ACCESS（CS 每帧写），读之前转到 COPY_SOURCE
+    {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = lodBuffer;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        list->ResourceBarrier(1, &barrier);
+    }
+
+    list->CopyBufferRegion(m_occlusionDebugReadback.Get(), 0, lodBuffer, 0,
+                           static_cast<UINT64>(copyCount) * sizeof(std::uint32_t));
+
+    {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = lodBuffer;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        list->ResourceBarrier(1, &barrier);
+    }
+
+    list->Close();
+    ID3D12CommandList* lists[] = { list.Get() };
+    m_commandQueue->ExecuteCommandLists(1, lists);
+
+    ++m_fenceValue;
+    m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+    if (m_fence->GetCompletedValue() < m_fenceValue)
+    {
+        m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
+
+    const D3D12_RANGE range = { 0, static_cast<SIZE_T>(copyCount) * sizeof(std::uint32_t) };
+    void* mapped = nullptr;
+    if (FAILED(m_occlusionDebugReadback->Map(0, &range, &mapped)))
+    {
+        return;
+    }
+
+    const std::uint32_t* values = reinterpret_cast<const std::uint32_t*>(mapped);
+    m_instanceLODCache.assign(values, values + copyCount);
+    m_occlusionDebugReadback->Unmap(0, nullptr);
+}
+
+void Renderer::HandleKey(UINT virtualKey)
+{
     constexpr float kRotateStep = 5.0f;
     constexpr float kMaxPitch = 85.0f;
 
@@ -1612,6 +3036,111 @@ void Renderer::HandleKey(UINT virtualKey){
     // 同样只置位，在下一帧 CPU 剔除完成后执行（那时两侧输入才是同帧同源的）。
     case 'G':
         m_cullComparisonRequested = true;
+        break;
+
+    // ---- M13：切换 Depth Prepass ----
+    // Main Pass 的深度状态烘焙在 PSO 里，所以这里只置位，
+    // 重建放到下一帧 WaitForGpu 之后（那时旧 PSO 已经不被 GPU 使用）。
+    case 'P':
+        m_depthPrepassEnabled = !m_depthPrepassEnabled;
+        m_pipelineStateRebuildRequested = true;
+        std::cout << "[Renderer] Depth prepass: "
+                  << (m_depthPrepassEnabled ? "ON (main pass reuses depth, LESS_EQUAL)"
+                                            : "OFF (single pass, LESS + write)")
+                  << "\n";
+        break;
+
+    // ---- M13：深度缓冲可视化 ----
+    case 'B':
+        m_depthVisualizeEnabled = !m_depthVisualizeEnabled;
+        std::cout << "[Renderer] Depth visualization: "
+                  << (m_depthVisualizeEnabled ? "ON" : "OFF") << "\n";
+        break;
+
+    // ---- M14：HZB 构建开关 ----
+    case 'H':
+        m_hzbEnabled = !m_hzbEnabled;
+        std::cout << "[Renderer] HZB build: " << (m_hzbEnabled ? "ON" : "OFF") << "\n";
+        break;
+
+    // ---- M16：GPU-Driven LOD 开关 ----
+    case 'L':
+        m_lodEnabled = !m_lodEnabled;
+        std::cout << "[Renderer] GPU LOD selection: "
+                  << (m_lodEnabled ? "ON" : "OFF (all instances use LOD0)") << "\n";
+        break;
+
+    // ---- M16：运行时调整 LOD 阈值（通过全局偏置）----
+    //
+    // 偏置是**加到 screenSize 上**的，语义等价于「整体平移所有阈值」：
+    //   偏置 > 0  -> screenSize 变大 -> 更容易满足高精度阈值 -> 偏向细 LOD
+    //   偏置 < 0  -> 偏向粗 LOD
+    //
+    // 这是验证「阈值确实在驱动切换」最直接的手段：
+    // 配合 --debug-viz 2 的四色视图，连续按键应看到 LOD 边界整体推移。
+    case VK_OEM_COMMA: // ',' 更粗
+        m_lodBias -= 0.02f;
+        if (m_lodBias < -0.20f) { m_lodBias = -0.20f; }
+        std::cout << "[Renderer] LOD bias = " << m_lodBias
+                  << "  (negative = coarser LODs)\n";
+        break;
+    case VK_OEM_PERIOD: // '.' 更细
+        m_lodBias += 0.02f;
+        if (m_lodBias > 0.20f) { m_lodBias = 0.20f; }
+        std::cout << "[Renderer] LOD bias = " << m_lodBias
+                  << "  (positive = finer LODs)\n";
+        break;
+
+    // ---- M15：HZB 遮挡剔除开关 ----
+    case 'O':
+        m_occlusionEnabled = !m_occlusionEnabled;
+        std::cout << "[Renderer] HZB occlusion culling: "
+                  << (m_occlusionEnabled ? "ON" : "OFF (draw all frustum-visible)")
+                  << "\n";
+        break;
+
+    // ---- M15：遮挡剔除可视化 ----
+    case 'K':
+        m_occlusionVisualize = !m_occlusionVisualize;
+        if (m_occlusionVisualize && m_debugViewMode < 2)
+        {
+            m_debugViewMode = 2; // 需要包围球这一层才能标注
+        }
+        std::cout << "[Renderer] Occlusion culled visualization: "
+                  << (m_occlusionVisualize
+                          ? "ON (yellow = frustum-visible but occlusion-culled)"
+                          : "OFF")
+                  << "\n";
+        break;
+
+    // ---- M14：HZB mip 可视化 ----
+    case 'N':
+        m_hzbVisualizeEnabled = !m_hzbVisualizeEnabled;
+        std::cout << "[Renderer] HZB visualization: "
+                  << (m_hzbVisualizeEnabled ? "ON" : "OFF")
+                  << " (viewing mip " << m_hzbViewMip << "/"
+                  << (m_hzb.GetMipCount() > 0 ? m_hzb.GetMipCount() - 1 : 0) << ")\n";
+        break;
+
+    // ---- M14：切换要查看的 HZB mip 级 ----
+    // '[' 往更细的一级走，']' 往更粗的一级走。
+    case VK_OEM_4: // '['
+        if (m_hzbViewMip > 0)
+        {
+            --m_hzbViewMip;
+        }
+        std::cout << "[Renderer] HZB view mip = " << m_hzbViewMip << " ("
+                  << m_hzb.GetMipWidth(m_hzbViewMip) << "x"
+                  << m_hzb.GetMipHeight(m_hzbViewMip) << ")\n";
+        break;
+    case VK_OEM_6: // ']'
+        if (m_hzb.GetMipCount() > 0 && m_hzbViewMip + 1 < m_hzb.GetMipCount())
+        {
+            ++m_hzbViewMip;
+        }
+        std::cout << "[Renderer] HZB view mip = " << m_hzbViewMip << " ("
+                  << m_hzb.GetMipWidth(m_hzbViewMip) << "x"
+                  << m_hzb.GetMipHeight(m_hzbViewMip) << ")\n";
         break;
 
     // ---- M12：切换渲染路径 ----
@@ -1689,7 +3218,120 @@ void Renderer::BuildStatisticsText()
         std::snprintf(line, sizeof(line), "CPU draws : %u   ExecIndirect: %u",
                       m_stats.submittedDrawCalls, m_stats.indirectExecuteCount);
         m_debugText.AddText(x, y, 1.0f, line);
-        y += 26.0f;
+        y += 18.0f;
+
+        // M13：Depth Prepass 状态与 GPU 侧耗时（Timestamp Query 测得）
+        std::snprintf(line, sizeof(line), "Prepass   : %s   [P] toggle",
+                      m_depthPrepassEnabled ? "ON" : "OFF");
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        std::snprintf(line, sizeof(line), "GPU cull  : %.3f ms", m_avgGpuCullMs);
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        std::snprintf(line, sizeof(line), "GPU depth : %.3f ms", m_avgGpuDepthMs);
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        std::snprintf(line, sizeof(line), "GPU main  : %.3f ms", m_avgGpuMainMs);
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        std::snprintf(line, sizeof(line), "Depth viz : %s   [B] toggle",
+                      m_depthVisualizeEnabled ? "ON" : "OFF");
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        // M14：HZB 金字塔
+        std::snprintf(line, sizeof(line), "HZB       : %s   %u mips  [H] toggle",
+                      m_hzbEnabled ? "ON " : "OFF", m_hzb.GetMipCount());
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        if (m_hzb.GetMipCount() > 0)
+        {
+            std::snprintf(line, sizeof(line), "HZB view  : mip %u/%u  %ux%u   [N] viz  [ / ] level",
+                          m_hzbViewMip, m_hzb.GetMipCount() - 1,
+                          m_hzb.GetMipWidth(m_hzbViewMip), m_hzb.GetMipHeight(m_hzbViewMip));
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+        }
+
+        // ---- M15：Frustum 与 Occlusion 剔除**分开统计** ----
+        //
+        // 这两个数字必须分开显示，否则无法判断「剔除到底发生在哪一步」：
+        //   实例总数 ──视锥剔除──▶ 候选数 ──遮挡剔除──▶ 最终可见数
+        //
+        // 注意它来自**延迟若干帧的 GPU 读回**（不阻塞），所以数值比画面略有滞后。
+        // frustumCulled 不需要额外统计 —— CPU 用「总数 − 候选数」直接算。
+        {
+            const std::uint32_t candidates = m_occlusionStats.valid
+                                                 ? m_occlusionStats.candidateCount
+                                                 : m_stats.visibleInstances;
+            const std::uint32_t occluded = m_occlusionStats.valid
+                                               ? m_occlusionStats.occludedCount
+                                               : 0u;
+            const std::uint32_t total = m_stats.totalInstances;
+            const std::uint32_t frustumCulled = (total > candidates) ? (total - candidates) : 0u;
+            const std::uint32_t finalVisible =
+                (candidates > occluded) ? (candidates - occluded) : 0u;
+
+            std::snprintf(line, sizeof(line), "Occlusion : %s   [O] toggle",
+                          m_occlusionEnabled ? "ON" : "OFF");
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+
+            std::snprintf(line, sizeof(line), "  frustum : %u culled (%.1f%%)", frustumCulled,
+                          total ? (100.0f * static_cast<float>(frustumCulled) /
+                                   static_cast<float>(total)) : 0.0f);
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+
+            std::snprintf(line, sizeof(line), "  occluded: %u of %u (%.1f%%)", occluded,
+                          candidates,
+                          candidates ? (100.0f * static_cast<float>(occluded) /
+                                        static_cast<float>(candidates)) : 0.0f);
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+
+            std::snprintf(line, sizeof(line), "  visible : %u   (conservative pass %u)",
+                          finalVisible,
+                          m_occlusionStats.valid ? m_occlusionStats.conservativePassCount : 0u);
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+        }
+
+        // ---- M16：GPU-Driven LOD 的每级使用数量 ----
+        //
+        // 数据来自帧 60 的一次性读回（VerifyLODDistribution），
+        // 所以它在整个运行期间是**静态**的 —— 改相机后需要重启才能刷新。
+        // 这是刻意的：持续读回会打断 GPU 流水线，而每级数量的用途是验收而非实时监控。
+        std::snprintf(line, sizeof(line), "GPU LOD   : %s   %u levels  [L] toggle",
+                      m_lodEnabled ? "ON " : "OFF", m_lodCount);
+        m_debugText.AddText(x, y, 1.0f, line);
+        y += 18.0f;
+
+        if (m_lodCount > 1 && m_lodTriangleBudget > 0)
+        {
+            std::snprintf(line, sizeof(line), "  LOD0..3 : %u / %u / %u / %u",
+                          m_lodCounts[0], m_lodCounts[1], m_lodCounts[2], m_lodCounts[3]);
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+
+            const std::uint64_t naive =
+                static_cast<std::uint64_t>(m_lodCounts[0] + m_lodCounts[1] +
+                                           m_lodCounts[2] + m_lodCounts[3]) *
+                768ull;
+            std::snprintf(line, sizeof(line), "  tris    : %u  (%.0f%% saved)",
+                          m_lodTriangleBudget,
+                          naive ? (100.0 * (1.0 - static_cast<double>(m_lodTriangleBudget) /
+                                                     static_cast<double>(naive)))
+                                : 0.0);
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+        }
+        y += 8.0f;
 
         // M9：确认实例数据已经在 GPU 上（DEFAULT Heap 的 StructuredBuffer）
         std::snprintf(line, sizeof(line), "GPU inst  : %u x %u B",
@@ -1763,19 +3405,19 @@ void Renderer::BuildStatisticsText()
         m_debugText.AddText(x, y, 1.0f, line);
         y += 26.0f;
 
-        m_debugText.AddText(x, y, 1.0f, "[1][2][3] count  [C] culling  [V] viz  [T] validate");
+        m_debugText.AddText(x, y, 1.0f, "[L] LOD  [,][.] LOD bias  [O] occlusion  [K] culled viz  [M] mode");
         y += 18.0f;
 
-        m_debugText.AddText(x, y, 1.0f, "[G] compare cull  [M] CPU/GPU mode  [V] viz  [T] validate");
+        m_debugText.AddText(x, y, 1.0f, "[G] compare  [T] validate  [P] prepass  [B] depth viz  [H] HZB  [N] viz");
         y += 18.0f;
 
-        m_debugText.AddText(x, y, 1.0f, "[1][2][3] count   [C] culling   [Space] orbit   [R] reset");
+        m_debugText.AddText(x, y, 1.0f, "[1][2][3] count  [C] culling  [V] viz  [Space] orbit  [R] reset");
     };
 
     // 背景条：实例场景里模型很密集，纯文字会淹没在几何细节中，
     // 铺一层半透明黑底后统计信息在任何视角下都清晰。
     m_debugText.SetColor(0.0f, 0.0f, 0.0f, 0.55f);
-    m_debugText.AddRect(4.0f, 4.0f, 620.0f, 500.0f);
+    m_debugText.AddRect(4.0f, 4.0f, 680.0f, 780.0f);
 
     // 阴影：让白色文字在浅色模型上也有边界
     m_debugText.SetColor(0.0f, 0.0f, 0.0f, 0.85f);
@@ -1920,9 +3562,14 @@ void Renderer::BuildDebugVisualization(FXMMATRIX viewProj,
 
     const XMFLOAT4 visibleColor = { 0.25f, 1.0f, 0.35f, 1.0f };
     const XMFLOAT4 culledColor = { 1.0f, 0.25f, 0.25f, 1.0f };
+    // M15：第三种颜色 —— 通过视锥测试、但被 HZB **遮挡剔除**掉了。
+    // 这是本阶段最值得肉眼确认的一类：它们**不应该**出现在画面上，
+    // 但它们的包围球仍然画出来，用来核对"剔掉的是不是真的看不见"。
+    const XMFLOAT4 occlusionCulledColor = { 1.0f, 0.85f, 0.15f, 1.0f };
 
     // 可见集合是有序的，用双指针遍历避免每帧构造哈希集合
     std::size_t visibleCursor = 0;
+    std::size_t gpuVisibleCursor = 0;
     std::size_t drawnSpheres = 0;
 
     for (std::size_t i = 0; i < total && drawnSpheres < kMaxSpheresToDraw; i += step)
@@ -1934,9 +3581,59 @@ void Renderer::BuildDebugVisualization(FXMMATRIX viewProj,
         const bool visible = (visibleCursor < visibleIndices.size() &&
                               visibleIndices[visibleCursor] == i);
 
-        m_debugLines.AddSphere(instances[i].boundingSphere,
-                               visible ? visibleColor : culledColor, 8);
+        XMFLOAT4 color = visible ? visibleColor : culledColor;
+
+        // M15：在「视锥内」的实例里，再区分出「被遮挡剔除」的那些
+        if (m_occlusionVisualize && visible)
+        {
+            while (gpuVisibleCursor < m_occlusionDebugVisible.size() &&
+                   m_occlusionDebugVisible[gpuVisibleCursor] < i)
+            {
+                ++gpuVisibleCursor;
+            }
+            const bool gpuVisible = (gpuVisibleCursor < m_occlusionDebugVisible.size() &&
+                                     m_occlusionDebugVisible[gpuVisibleCursor] == i);
+            if (!gpuVisible)
+            {
+                color = occlusionCulledColor; // 视锥内 + 被遮挡剔除
+            }
+        }
+
+        m_debugLines.AddSphere(instances[i].boundingSphere, color, 8);
         ++drawnSpheres;
+    }
+
+    // -------------------------------------------------------------------------
+    // M16：按所选 LOD 着色（任务要求的可视化）
+    //
+    //   颜色直接来自剔除 CS 写下的 gInstanceLOD，所以它反映的是
+    //   **GPU 的真实决定**，而不是 CPU 的猜测 —— 这是验证
+    //   「LOD Selection 确实在 GPU 完成」最直观的手段。
+    //
+    //   着色约定：LOD0 = 红 / LOD1 = 黄 / LOD2 = 绿 / LOD3 = 蓝
+    // -------------------------------------------------------------------------
+    if (m_lodEnabled && m_lodCount > 1 && !m_instanceLODCache.empty())
+    {
+        static const XMFLOAT4 kLODColors[8] = {
+            { 1.00f, 0.15f, 0.15f, 1.0f }, // LOD0 红
+            { 1.00f, 0.90f, 0.15f, 1.0f }, // LOD1 黄
+            { 0.20f, 1.00f, 0.25f, 1.0f }, // LOD2 绿
+            { 0.25f, 0.45f, 1.00f, 1.0f }, // LOD3 蓝
+            { 1.00f, 0.20f, 1.00f, 1.0f },
+            { 0.20f, 1.00f, 1.00f, 1.0f },
+            { 1.00f, 0.55f, 0.10f, 1.0f },
+            { 0.60f, 0.60f, 0.60f, 1.0f },
+        };
+
+        for (std::size_t i = 0; i < total && i < m_instanceLODCache.size(); i += step)
+        {
+            const std::uint32_t lod = m_instanceLODCache[i];
+            if (lod >= m_lodCount || lod >= 8u)
+            {
+                continue;
+            }
+            m_debugLines.AddSphere(instances[i].boundingSphere, kLODColors[lod], 12);
+        }
     }
 
     m_debugLines.End();

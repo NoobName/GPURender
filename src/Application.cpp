@@ -4,7 +4,9 @@
 
 bool Application::Initialize(std::uint32_t initialInstanceCount, bool useCpuCulling,
                              float cameraYawDegrees, int debugViewMode, bool compareCulling,
-                             bool gpuDriven)
+                             bool gpuDriven, bool depthPrepass, bool depthVisualize,
+                             bool hzbVisualize, std::uint32_t hzbMip,
+                             bool occlusion, bool occlusionViz)
 {
     // 1. D3D12 上下文（Debug Layer -> Factory -> Adapter -> Device）
     if (!m_d3d12.Initialize())
@@ -25,7 +27,9 @@ bool Application::Initialize(std::uint32_t initialInstanceCount, bool useCpuCull
     if (!m_renderer.Initialize(m_d3d12.GetDevice(), m_d3d12.GetFactory(),
                                m_window.GetHandle(), m_window.GetWidth(), m_window.GetHeight(),
                                initialInstanceCount, useCpuCulling,
-                               cameraYawDegrees, debugViewMode, compareCulling, gpuDriven))
+                               cameraYawDegrees, debugViewMode, compareCulling, gpuDriven,
+                               depthPrepass, depthVisualize, hzbVisualize, hzbMip,
+                               occlusion, occlusionViz))
     {
         return false;
     }

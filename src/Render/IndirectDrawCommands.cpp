@@ -6,7 +6,8 @@
 
 namespace
 {
-constexpr UINT kCommandConstantDwords = 4; // maxCommands / indexCount / pad / pad
+// root constants：{ lodCount, pad0, pad1, pad2 }
+constexpr UINT kCommandConstantDwords = 4;
 
 bool CreateUavBuffer(ID3D12Device* device, UINT64 sizeBytes, ID3D12Resource** out)
 {
@@ -32,25 +33,29 @@ bool CreateUavBuffer(ID3D12Device* device, UINT64 sizeBytes, ID3D12Resource** ou
 
 bool IndirectDrawCommands::Initialize(ID3D12Device* device,
                                       std::uint32_t maxInstances,
+                                      std::uint32_t lodCount,
                                       ID3D12DescriptorHeap* descriptorHeap,
                                       UINT descriptorSize,
-                                      UINT argumentsUavSlot,
-                                      UINT visibleIndicesSrvSlot,
-                                      UINT visibleCountSrvSlot)
+                                      UINT argumentsUavSlot)
 {
-    m_capacity = maxInstances;
+    if (lodCount == 0)
+    {
+        std::cerr << "[IndirectDrawCommands] lodCount must be > 0\n";
+        return false;
+    }
+
+    m_maxInstances = maxInstances;
+    m_lodCount = lodCount;
     m_argumentsUavSlot = argumentsUavSlot;
-    m_visibleIndicesSrvSlot = visibleIndicesSrvSlot;
-    m_visibleCountSrvSlot = visibleCountSrvSlot;
 
     // -------------------------------------------------------------------------
     // 1. Indirect Argument Buffer
     //
-    // 容量按最大实例数：最坏情况「全部可见」，就是 N 条命令。
-    // 100k 实例 -> 100000 * 20 B = 2 MB。
+    // 容量 = LOD 级数（每个 LOD 一条命令），不再是「最大可见实例数」。
+    // 4 级 -> 4 * 20 B = 80 字节。这是 M16 相对 M12 的一个显著收益：
+    // 命令缓冲与可见数**彻底解耦**了。
     // -------------------------------------------------------------------------
-    const UINT64 argumentBytes =
-        static_cast<UINT64>(maxInstances) * kDrawIndexedArgumentSize;
+    const UINT64 argumentBytes = static_cast<UINT64>(lodCount) * kDrawIndexedArgumentSize;
     if (!CreateUavBuffer(device, argumentBytes, &m_arguments))
     {
         std::cerr << "[IndirectDrawCommands] Failed to create argument buffer.\n";
@@ -62,7 +67,7 @@ bool IndirectDrawCommands::Initialize(ID3D12Device* device,
     uavDesc.Format = DXGI_FORMAT_R32_UINT;
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     uavDesc.Buffer.FirstElement = 0;
-    uavDesc.Buffer.NumElements = maxInstances * (kDrawIndexedArgumentSize / 4u);
+    uavDesc.Buffer.NumElements = lodCount * (kDrawIndexedArgumentSize / 4u);
     uavDesc.Buffer.StructureByteStride = 0; // RAW 视图
     uavDesc.Buffer.CounterOffsetInBytes = 0;
     uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
@@ -98,18 +103,18 @@ bool IndirectDrawCommands::Initialize(ID3D12Device* device,
     }
 
     // -------------------------------------------------------------------------
-    // 3. 命令生成 Compute Pass 的根签名
+    // 3. 命令生成 Compute Pass 的根签名（M16：4 个参数）
     //
-    // 参数 0：32-bit root constants (b0) = { maxCommands, indexCount, pad, pad }
-    // 参数 1：SRV 表 (t0, t1) = { 可见索引列表, 可见计数器 }
-    // 参数 2：UAV 表 (u0)     = { indirect argument buffer }
+    // 参数 0：32-bit root constants (b0) = { lodCount, pad, pad, pad }
+    // 参数 1：SRV 表 (t0) = { LOD 元数据 }
+    // 参数 2：SRV 表 (t1) = { 每级实例计数器 }
+    // 参数 3：UAV 表 (u0) = { indirect argument buffer }
     //
-    // 注意 t0/t1 用 ByteAddressBuffer 绑定，而这两个资源在 M11 里是以
-    // RWByteAddressBuffer / RWStructuredBuffer 的 UAV 形式创建的 ——
-    // 同一个资源可以同时有 SRV 与 UAV 视图，这里读它们用的是 **SRV 视图**
-    // （只读访问能走只读缓存路径，比用 UAV 读更合适）。
+    // 为什么把两个 SRV 拆成两张表而不是一张：描述符表只能取堆里**连续**区间，
+    // 而 LOD 元数据与可见列表的计数器在全局槽位规划里相距很远。
+    // 拆成两张各 1 个描述符的表，就完全不受槽位布局约束。
     // -------------------------------------------------------------------------
-    D3D12_ROOT_PARAMETER params[3] = {};
+    D3D12_ROOT_PARAMETER params[4] = {};
 
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
@@ -117,16 +122,27 @@ bool IndirectDrawCommands::Initialize(ID3D12Device* device,
     params[0].Constants.Num32BitValues = kCommandConstantDwords;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    D3D12_DESCRIPTOR_RANGE srvRange = {};
-    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange.NumDescriptors = 2; // t0 + t1
-    srvRange.BaseShaderRegister = 0;
-    srvRange.RegisterSpace = 0;
-    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    D3D12_DESCRIPTOR_RANGE lodRange = {};
+    lodRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    lodRange.NumDescriptors = 1; // t0
+    lodRange.BaseShaderRegister = 0;
+    lodRange.RegisterSpace = 0;
+    lodRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
-    params[1].DescriptorTable.pDescriptorRanges = &srvRange;
+    params[1].DescriptorTable.pDescriptorRanges = &lodRange;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_DESCRIPTOR_RANGE countRange = {};
+    countRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    countRange.NumDescriptors = 1; // t1
+    countRange.BaseShaderRegister = 1;
+    countRange.RegisterSpace = 0;
+    countRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[2].DescriptorTable.NumDescriptorRanges = 1;
+    params[2].DescriptorTable.pDescriptorRanges = &countRange;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_DESCRIPTOR_RANGE uavRange = {};
     uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -134,13 +150,13 @@ bool IndirectDrawCommands::Initialize(ID3D12Device* device,
     uavRange.BaseShaderRegister = 0;
     uavRange.RegisterSpace = 0;
     uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 1;
-    params[2].DescriptorTable.pDescriptorRanges = &uavRange;
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[3].DescriptorTable.NumDescriptorRanges = 1;
+    params[3].DescriptorTable.pDescriptorRanges = &uavRange;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-    rootDesc.NumParameters = 3;
+    rootDesc.NumParameters = 4;
     rootDesc.pParameters = params;
     rootDesc.NumStaticSamplers = 0;
     rootDesc.pStaticSamplers = nullptr;
@@ -186,9 +202,10 @@ bool IndirectDrawCommands::Initialize(ID3D12Device* device,
         return false;
     }
 
-    std::cout << "[IndirectDrawCommands] Ready: capacity " << m_capacity
-              << " commands x " << kDrawIndexedArgumentSize << " B = "
-              << (argumentBytes / 1024.0 / 1024.0) << " MB argument buffer\n";
+    std::cout << "[IndirectDrawCommands] Ready: " << m_lodCount
+              << " LOD commands x " << kDrawIndexedArgumentSize << " B = "
+              << argumentBytes << " B argument buffer"
+              << " (max " << m_maxInstances << " instances tracked)\n";
     return true;
 }
 
@@ -295,7 +312,7 @@ void IndirectDrawCommands::Record(ID3D12GraphicsCommandList* cmd,
                                   ID3D12DescriptorHeap* descriptorHeap,
                                   UINT descriptorSize,
                                   VisibleInstanceList& visibleList,
-                                  UINT indexCount)
+                                  UINT lodMetadataSrvSlot)
 {
     // ---- 1. UAV barrier：保证 M11 的压缩结果对本次读取可见（RAW）----
     //
@@ -333,28 +350,34 @@ void IndirectDrawCommands::Record(ID3D12GraphicsCommandList* cmd,
     cmd->SetComputeRootSignature(m_rootSignature.Get());
     cmd->SetPipelineState(m_pipelineState.Get());
 
-    // 根参数 0：{ maxCommands, indexCount, 0, 0 }
+    // 根参数 0：{ lodCount, 0, 0, 0 }
     const std::uint32_t constants[kCommandConstantDwords] = {
-        m_capacity, indexCount, 0u, 0u
+        m_lodCount, 0u, 0u, 0u
     };
     cmd->SetComputeRoot32BitConstants(0, kCommandConstantDwords, constants, 0);
 
-    // 根参数 1：SRV 表 -> t0 可见索引、t1 可见计数
-    D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
-    srvHandle.ptr += static_cast<UINT64>(m_visibleIndicesSrvSlot) * descriptorSize;
-    cmd->SetComputeRootDescriptorTable(1, srvHandle);
+    // 根参数 1：SRV 表 -> t0 LOD 元数据
+    D3D12_GPU_DESCRIPTOR_HANDLE lodHandle = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    lodHandle.ptr += static_cast<UINT64>(lodMetadataSrvSlot) * descriptorSize;
+    cmd->SetComputeRootDescriptorTable(1, lodHandle);
 
-    // 根参数 2：UAV 表 -> u0 参数缓冲
+    // 根参数 2：SRV 表 -> t1 每级实例计数器
+    D3D12_GPU_DESCRIPTOR_HANDLE countHandle = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    countHandle.ptr += static_cast<UINT64>(visibleList.GetCountSrvSlot()) * descriptorSize;
+    cmd->SetComputeRootDescriptorTable(2, countHandle);
+
+    // 根参数 3：UAV 表 -> u0 参数缓冲
     D3D12_GPU_DESCRIPTOR_HANDLE uavHandle = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
     uavHandle.ptr += static_cast<UINT64>(m_argumentsUavSlot) * descriptorSize;
-    cmd->SetComputeRootDescriptorTable(2, uavHandle);
+    cmd->SetComputeRootDescriptorTable(3, uavHandle);
 
     // ---- 5. Dispatch ----
     //
-    // 线程组数按**容量上限**取整，而不是按可见数 —— 因为 CPU 根本不知道可见数。
-    // 这是 GPU-Driven 的一个直接体现：dispatch 规模是固定的，
-    // 实际做多少事由 GPU 内部的数据决定。
-    const UINT groupCount = (m_capacity + 63u) / 64u;
+    // 一个线程写一条命令（一个 LOD），所以组数按 LOD 级数取整。
+    // **注意**：块大小是 8（见 GenerateDrawCommandsCS.hlsl 的 numthreads）。
+    // 实际的 InstanceCount 仍然完全由 GPU 决定，CPU 不知道也不需要知道。
+    constexpr UINT kCommandThreadGroupSize = 8u;
+    const UINT groupCount = (m_lodCount + kCommandThreadGroupSize - 1u) / kCommandThreadGroupSize;
     cmd->Dispatch(groupCount, 1, 1);
 
     // ---- 6. UAV barrier：写入 vs 之后 ExecuteIndirect 的读取（RAW）----

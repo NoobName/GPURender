@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+﻿cmake_minimum_required(VERSION 3.24)
 
 project(GPUDrivenRenderer VERSION 0.1.0 LANGUAGES CXX)
 
@@ -33,6 +33,10 @@ add_executable(GPUDrivenRenderer
     src/Render/VisibleInstanceList.cpp
     src/Render/GPUFrustumCuller.cpp
     src/Render/IndirectDrawCommands.cpp
+    src/Render/GPUProfiler.cpp
+    src/Render/HierarchicalZBuffer.cpp
+    src/Render/HZBOcclusionCuller.cpp
+    src/Render/MeshLOD.cpp
     src/Asset/ObjLoader.cpp
     src/Asset/TgaLoader.cpp
     src/Scene/Scene.cpp

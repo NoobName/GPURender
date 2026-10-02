@@ -1,4 +1,4 @@
-# GPUDrivenRenderer
+﻿# GPUDrivenRenderer
 
 一个从零构建的现代 GPU-Driven 实时渲染器，使用 C++20、DirectX 12 与 HLSL。
 
@@ -20,7 +20,35 @@
   - **`record`（CPU 记录命令耗时）：1.303 ms → 0.087 ms（15×）**
   - 与 CPU-Driven 逐像素对比：3D 区域 99.998% 相同（9 个像素为深度测试边界差异）
   - 运行中按 `M` 切换两条路径，或用 `--gpu-driven` 启动
-- 尚未实现遮挡剔除、LOD 与 Meshlet。
+- **Milestone M13** ✅：**Depth Prepass Architecture** —— 在 GPU-Driven 的绘制之前插入一遍 depth-only 渲染（无像素着色器，复用同一个 VS 与根签名），主 Pass 以 `LESS_EQUAL` + 不写深度的方式复用它的深度，让 Early-Z 在像素着色之前丢弃被遮挡的片元。
+  - 引入 **GPU Timestamp 测量**：把每帧切成 `cull / depth / main` 三段，用环形缓冲延迟 3 帧读回，**不引入任何 CPU 同步**
+  - 新增**深度缓冲可视化**（全屏三角形 + 深度线性化，按 `B` 切换）
+  - 实测结论（Release，100k 实例）：**本项目场景下 prepass 净亏损** —— ON 1.44 ms vs OFF 0.88 ms。几何量极大（92 万三角形）而 overdraw 极低，主 Pass 的 Early-Z 几乎没省下东西（0.81 vs 0.88 ms），多出来的 0.60 ms 深度 Pass 就是纯亏损。完整分析见 `docs/LEARNING_NOTES.md` M13 Q3
+  - ⚠️ 本阶段的测量曾一度被**显存压力**污染（读数虚高 10 倍以上，并导致一个关于 `NumRenderTargets` 的错误结论）。释放显存后重测并修正了全部文档 —— 这个教训本身也记入了学习笔记 1.7 节
+- **Milestone M14** ✅：**Hierarchical Z-Buffer Generation** —— 用 Depth Prepass 的深度在 GPU 上逐级 **Max 归约**，构建从 640x360 到 **1x1** 的完整深度金字塔（10 级，全部由 Compute Shader 生成，**零 CPU 回读**）。
+  - **Reduction Convention 已显式记录**：D3D 传统深度（近 0 远 1，越大越远）→ **Max**。保守性证明：z_obj > max(D) 意味着物体比该区域内所有像素都远，判定「被遮挡」是**充分**的；换成 Min 会误剔除可见物体
+  - 每级之间用 **UAV barrier** 同步（整条链常驻 UNORDERED_ACCESS，状态转换帮不上忙）
+  - 每个 mip 一个 **UAV 描述符并连续排列**，使降采样能用一张覆盖 2 个描述符的表同时绑定「源 mip / 目标 mip」
+  - **任意 mip 级均可可视化**（`N` 键 / `--hzb-viz`，`[` `]` 或 `--hzb-mip N` 选级）
+  - **实测验证**（帧 60 一次性读回）：10 级中心深度**单调不减**（HZB[i] <= HZB[i+1]，Max 归约的必要条件），全部落在 [0,1]，最后一级 1x1 = **1.000000** 正是背景深度 —— 三点校验全部 PASSED
+- **Milestone M15** ✅：**HZB GPU Occlusion Culling** —— 用 M14 的深度金字塔对视锥内候选做**保守**遮挡测试，把确定看不见的实例从 Main Pass 的绘制列表里去掉。
+  - 六步判定：包围球投影 → 屏幕矩形估计（半径分母是 sqrt(d²−r²)）→ 按投影尺寸选 mip → 采样保守深度（区域 max）→ 与物体最近深度比较 → Visible/Occluded
+  - **六处「偏向 Visible」的保守设计**：球在相机后 / 穿近平面 / 完全出屏 / mip 用 ceil 取更粗 / 采样外扩 1 像素 / 深度比较加 bias。**屏幕边缘只要与画面有重叠就一定走完整测试**，不会随机消失
+  - **Visualization Mode**：`K` / `--occlusion-viz` 把包围球按三类状态着色 —— 绿 = 最终可见、红 = 视锥剔除、**黄 = 通过视锥但被遮挡剔除**（实现上零新增 GPU 资源，用 CPU 视锥内集合与 GPU 可见列表作差）
+  - **Frustum Culling 与 Occlusion Culling 分开统计**（候选数 / 遮挡剔除数 / 保守放行数 / HZB 采样数），统计走延迟读回，**不引入同步**
+  - **实测正确性**：occlusion ON vs OFF 画面逐像素对比 **0 / 432,000 差异（0.000%）** —— False Positive Culling = **0**
+  - **实测剔除率**：10k 实例下 7,684 个候选中剔除 **6,810（88.6%）**，仅 61 个走保守放行
+  - ⚠️ **实测性能：本场景下净亏损**（gpuMain +27%~+51%）。原因：M13 的 Depth Prepass + Early-Z **已经**让被遮挡片元在像素着色前被丢弃，所以遮挡剔除只剩「省顶点处理」这点收益，抵不过 occlusion CS 的随机 HZB 采样。完整分析与「什么场景它才会赢」见 docs/LEARNING_NOTES.md M15 Q4
+  - 已知 Limitation 共 9 条（two-phase、AABB 支持、采样次数偏多、可视化读回会打断流水线等）已记录在学习笔记第 4 节
+- **Milestone M16** ✅：**GPU-Driven LOD Selection** —— 每个 Mesh 提供 4 级 Index Range（细分立方体 768/192/48/12 三角形），由**剔除 CS 按投影后的屏幕尺寸**选级，间接命令直接使用该级的几何偏移。CPU 每帧都不再为任何实例选 LOD。
+  - **每个 LOD 一条间接命令**：几何选择只能表达在命令的 IndexCount / StartIndexLocation / BaseVertexLocation 里，所以 M12 的「全世界一条命令」必须演进成「每级一条」——ExecuteIndirect 次数从常数 1 变成常数 N（=4），但每条命令的 InstanceCount 仍完全由 GPU 决定
+  - **判据**：screenSize = 2·r·P11 / sqrt(d²−r²)（球到切平面的距离）→ **占屏幕高度比例**，阈值与分辨率无关
+  - **每段一个 SRV**，让顶点着色器**完全不需要知道 LOD 存在**（把「着色器需要新参数」转化成「绑定需要换一张表」）
+  - **实测**：LOD 分布 469/4332/2862/21，**渲染三角形减少 77.5%**（1,329,564 vs 5,901,312）
+  - **命令缓冲与实例数彻底解耦**：从 M12 的 maxInstances × 20 B（2 MB）变成 lodCount × 20 B（**80 B**）
+  - 可视化：`L` 键 / `--debug-viz 2`，包围球按 GPU 实际选中的 LOD 着色（**红=LOD0 / 黄=LOD1 / 绿=LOD2 / 蓝=LOD3**）
+  - 已知 Limitation 8 条（与 M15 遮挡剔除互斥、无网格简化、无 hysteresis 与 morphing 等）见学习笔记 M16 第 3 节
+- 尚未实现 two-phase occlusion culling、per-LOD 遮挡剔除与 Meshlet。
 
 ## 技术栈
 
@@ -48,6 +76,18 @@ scripts\build_debug.bat    :: 配置（NMake 生成器）+ 编译 Debug x64
 scripts\run_debug.bat      :: 运行 Debug
 scripts\build_release.bat  :: 编译 Release x64
 ```
+
+验证 M16 的 GPU LOD（在项目根目录的 CMD 中运行）：
+
+```bat
+scripts\build_debug.bat
+scripts\run_debug.bat --instances 10000 --gpu-driven --no-occlusion
+```
+
+`run_debug.bat` 会准备 Debug 运行库环境，并把全部命令行参数转交给程序。
+当前项目不提供 `build\nmake-debug\run_m8.bat`，请使用上面的正式启动脚本。
+M16 的 LOD 与遮挡剔除暂时互斥，因此此处使用 `--no-occlusion`。
+需要输出 GPU/CPU 可见集和 LOD 分布校验时，再加上 `--compare-cull`。
 
 ### 方式二：标准 CMake 预设（VS2022 正常安装时）
 
@@ -83,6 +123,12 @@ GPUDrivenRenderer.exe --instances 100000 --yaw 90     :: 指定初始相机朝�
 GPUDrivenRenderer.exe --instances 2000 --debug-viz 2  :: 调试可视化：0=关 1=视锥 2=视锥+包围球
 GPUDrivenRenderer.exe --compare-cull                  :: 启动时做一次 GPU vs CPU 剔除结果对比
 GPUDrivenRenderer.exe --gpu-driven                    :: 用 ExecuteIndirect 渲染（GPU-Driven）
+GPUDrivenRenderer.exe --no-prepass                    :: 关闭 Depth Prepass（单遍渲染）
+GPUDrivenRenderer.exe --depth-viz                     :: 显示深度缓冲
+GPUDrivenRenderer.exe --hzb-viz                       :: 显示 HZB 深度金字塔
+GPUDrivenRenderer.exe --hzb-mip 5                     :: 显示 HZB 第 5 级 mip
+GPUDrivenRenderer.exe --no-occlusion                  :: 关闭 HZB 遮挡剔除（A/B 对比）
+GPUDrivenRenderer.exe --occlusion-viz                 :: 可视化被遮挡剔除的实例
 GPUDrivenRenderer.exe --help                          :: 查看用法
 ```
 
@@ -99,6 +145,13 @@ GPUDrivenRenderer.exe --help                          :: 查看用法
 | `T` | 在 GPU 上重新验证实例数据（C++ / HLSL 布局一致性） |
 | `G` | 对比 GPU 与 CPU 的可见集（回读压缩列表，校验越界 / 重复 / 集合差异） |
 | `M` | 切换渲染路径：CPU-Driven（逐个实例提交）↔ GPU-Driven（一次 ExecuteIndirect） |
+| `P` | 切换 Depth Prepass（切换时会重建 PSO） |
+| `B` | 切换深度缓冲可视化 |
+| `N` | 切换 HZB 金字塔可视化 |
+| `[` / `]` | 选择要查看的 HZB mip 级（更细 / 更粗） |
+| `H` | 开关 HZB 构建 |
+| `O` | 开关 HZB 遮挡剔除 |
+| `K` | 可视化被遮挡剔除的实例 |
 
 屏幕左上角实时显示：实例总数、可见数、draw call 数，以及分阶段的 CPU 帧时间
 （`update` / `record` / `present`）。控制台每 60 帧输出一行 `[Bench] ...` 便于脚本采集。

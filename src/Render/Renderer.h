@@ -12,7 +12,11 @@
 #include "Render/DebugLines.h"
 #include "Render/DebugText.h"
 #include "Render/GPUBuffer.h"
+#include "Render/GPUProfiler.h"
 #include "Render/GPUFrustumCuller.h"
+#include "Render/MeshLOD.h"
+#include "Render/HierarchicalZBuffer.h"
+#include "Render/HZBOcclusionCuller.h"
 #include "Render/IndirectDrawCommands.h"
 #include "Render/InstanceBuffer.h"
 #include "Render/InstanceValidator.h"
@@ -106,7 +110,7 @@ class Renderer
 {
 public:
     static constexpr UINT kFrameCount = 3;         // 三重缓冲
-    static constexpr UINT kMaxTextures = 16;       // CBV/SRV/UAV 描述符堆容量
+    static constexpr UINT kMaxTextures = 48;       // CBV/SRV/UAV 描述符堆容量
 
     // 描述符堆里的槽位分配（CBV_SRV_UAV 是同一种堆类型，SRV 与 UAV 混排）
     //
@@ -122,6 +126,28 @@ public:
     static constexpr UINT kVisibilityUavSlot = 7;         // 可见索引 UAV（M11）       [剔除表: 7,8]
     static constexpr UINT kVisibleCountUavSlot = 8;       // 可见计数 UAV（M11）       [剔除表: 7,8]
     static constexpr UINT kIndirectArgsUavSlot = 9;       // 间接命令参数 UAV（M12）
+    static constexpr UINT kDepthSrvSlot = 10;             // 深度缓冲 SRV（M13，可视化 + HZB 输入）
+    // M14：HZB 每个 mip 一个 UAV 描述符，必须**连续**排列 ——
+    // 降采样 CS 用一张覆盖 2 个描述符的表同时绑定「源 mip / 目标 mip」。
+    static constexpr UINT kHZBFirstMipUavSlot = 11;
+    static constexpr UINT kHZBSrvSlot = kHZBFirstMipUavSlot + HierarchicalZBuffer::kMaxMips; // 27
+    // M15：遮挡剔除
+    //   28 = 统计 UAV；29..32 = 遮挡剔除的可见列表（UAV/SRV）；33..37 = occlusion CS 的表
+    static constexpr UINT kOcclusionStatsUavSlot = 28;
+    static constexpr UINT kOcclusionStatsSrvSlot = 33;
+    // M16：LOD
+    //   38 = LOD 元数据 SRV（MeshLODRange 数组）
+    //   39..42 = **每级一个**分段 SRV —— 指向 per-LOD 索引列表里对应的那一段。
+    //
+    //   为什么按段建 SRV，而不是让顶点着色器用 root constant 算偏移：
+    //   ExecuteIndirect 一次可以提交多条命令，中间**没有 CPU 介入的机会**，
+    //   所以「当前画的是第几级」这个信息没法在两次 draw 之间用 root constant 传进去。
+    //   按段建 SRV 之后，每次 ExecuteIndirect 之前换一次描述符表即可，
+    //   **顶点着色器完全不需要知道 LOD 的存在**（SV_InstanceID 仍然从 0 开始索引单段列表）。
+    static constexpr UINT kLODMetadataSrvSlot = 38;
+    static constexpr UINT kLODSegmentSrvSlot = 39;
+    // 每实例 LOD UAV（M16，仅可视化用）。由 GPUFrustumCuller 写入。
+    static constexpr UINT kInstanceLodUavSlot = 43;
 
     // 渲染模式：CPU 逐实例提交 vs GPU-Driven ExecuteIndirect
     enum class RenderMode
@@ -134,13 +160,18 @@ public:
     static constexpr UINT kUiConstantSlot = kMaxInstances;        // UI 正交投影常量
     static constexpr UINT kDebugConstantSlot = kMaxInstances + 1;  // 调试线框（复用场景 viewProj）
     static constexpr UINT kGlobalConstantSlot = kMaxInstances + 2; // M12：GPU-Driven 的每帧全局常量
+    static constexpr UINT kDepthVisualizeConstantSlot = kMaxInstances + 3; // M13：深度可视化常量
+    static constexpr UINT kHZBVisualizeConstantSlot = kMaxInstances + 4;   // M14：HZB mip 可视化常量
 
     // 启动配置全部来自命令行；运行中可用按键改变（1/2/3 规模、C 剔除、V 可视化、方向键转视角）。
     bool Initialize(ID3D12Device* device, IDXGIFactory4* factory, HWND hwnd,
                     UINT width, UINT height, std::uint32_t initialInstanceCount = 1000,
                     bool useCpuCulling = true, float cameraYawDegrees = 0.0f,
                     int debugViewMode = 0, bool compareCullingAtStartup = false,
-                    bool gpuDriven = false);
+                    bool gpuDriven = false, bool depthPrepass = true,
+                    bool depthVisualize = false, bool hzbVisualize = false,
+                    std::uint32_t hzbMip = 0, bool occlusion = true,
+                    bool occlusionViz = false);
     void Shutdown();
     void Render();
 
@@ -161,6 +192,9 @@ private:
     bool CreatePipelineState(ID3D12Device* device);      // 网格 PSO
     bool CreateUiPipelineState(ID3D12Device* device);    // UI PSO（alpha 混合、关闭深度）
     bool CreateDebugPipelineState(ID3D12Device* device); // 调试线框 PSO（LINELIST、关闭深度）
+    bool CreateDepthOnlyPipelineState(ID3D12Device* device);      // M13：Depth Prepass PSO
+    bool CreateDepthVisualizePipelineState(ID3D12Device* device); // M13：深度可视化 PSO
+    bool CreateHZBVisualizePipelineState(ID3D12Device* device);   // M14：HZB mip 可视化 PSO
     bool CreateDepthBuffer(ID3D12Device* device);
     bool CreateConstantBuffers(ID3D12Device* device);
     bool CreateAssets(ID3D12Device* device);
@@ -288,7 +322,91 @@ private:
     // 用 GPU-Driven 路径记录绘制（一次 ExecuteIndirect 提交全部可见实例）。
     // visibleCount 是本帧 CPU 侧的可见数，只用作 MaxCommandCount 的**上限**；
     // 真正的条数由 GPU 的计数器决定（见实现里的两种取法）。
-    void RecordGpuDrivenDraw(UINT indexCount, std::uint32_t visibleCount);
+    void RecordGpuDrivenDraw(std::uint32_t visibleCount, UINT segmentSrvBaseSlot,
+                             std::uint32_t lodCount);
+
+    // ---- M13：Depth Prepass ----
+    // 用可见实例的间接命令跑一遍深度（depth-only PSO，无 RTV）；
+    // 之后 Main Pass 以 LESS_EQUAL + 不写深度的方式复用它。
+    void RecordDepthPrepass();
+    // 深度可视化：全屏三角形采样深度缓冲。
+    void RecordDepthVisualization();
+
+    // ---- M14：HZB ----
+    // 构建完整的深度金字塔（mip 0 由深度生成，其余逐级 2x2 Max 降采样到 1x1）。
+    void RecordHZBBuild();
+    // 可视化指定的 HZB mip 级。
+    void RecordHZBVisualization();
+
+    // ---- M16：GPU-Driven LOD ----
+    // LOD 链元数据（CPU 生成，上传到 GPU 供剔除 CS 读取）
+    std::vector<MeshLODRange> m_lodRanges;
+    ComPtr<ID3D12Resource> m_lodMetadataBuffer;
+    std::uint32_t m_lodCount = 1;
+    bool m_lodEnabled = true;          // 按 L 切换
+    float m_lodBias = 0.0f;            // 全局 LOD 偏置
+    std::uint32_t m_lodTriangleBudget = 0; // 上一帧实际渲染的三角形数（统计）
+    std::uint32_t m_lodCounts[8] = {};      // 每级实例数（延迟读回）
+    uint64_t m_lodStatsReadbackFrame = 0;
+
+    bool CreateLODChain(ID3D12Device* device, ID3D12GraphicsCommandList* cmd,
+                        std::vector<ComPtr<ID3D12Resource>>& stagingOut);
+    void CreateLODSegmentSrvs(ID3D12Device* device, VisibleInstanceList& list);
+    // 一次性验证：读回 per-LOD 计数器，确认选择真的在 GPU 上发生
+    void VerifyLODDistribution();
+    bool m_lodVerifyDone = false;
+
+    // M16 可视化：读回每实例的 LOD（延迟，仅 debug viz 时执行）
+    void ReadbackInstanceLOD();
+    std::vector<std::uint32_t> m_instanceLODCache; // [实例下标] = LOD
+    UINT m_lodReadbackCounter = 0;
+
+    // ---- M15：HZB 遮挡剔除 ----
+    // 对「视锥内候选」做保守遮挡测试，输出最终可见列表。
+    void RecordOcclusionCulling(UINT frameIndexForStats);
+    // 可视化：画被剔除实例的包围球（延迟一帧，避免同步）
+    void BuildOcclusionDebugLines();
+
+    HZBOcclusionCuller m_occlusionCuller;
+    bool m_occlusionEnabled = true;      // 按 O 切换
+    bool m_occlusionVisualize = false;   // 按 K 切换
+    float m_occlusionDepthBias = 0.0002f; // NDC 单位的保守偏置
+
+    // 遮挡剔除统计（延迟 kFrameRingSize 帧读回）
+    HZBOcclusionCuller::FrameStats m_occlusionStats;
+
+    // 遮挡剔除可视化：GPU 最终可见列表（延迟读回 + 排序，供双指针遍历）
+    std::vector<std::uint32_t> m_occlusionDebugVisible;
+    bool CreateOcclusionDebugReadback(ID3D12Device* device);
+    ComPtr<ID3D12Resource> m_occlusionDebugReadback;
+
+    HierarchicalZBuffer m_hzb;
+    ComPtr<ID3D12PipelineState> m_hzbVisualizePipelineState;
+    bool m_hzbEnabled = true;        // 按 H 切换构建
+    bool m_hzbVisualizeEnabled = false; // 按 N 切换可视化
+    UINT m_hzbViewMip = 0;           // 当前查看的 mip（[ / ] 切换）
+    UINT m_avgHZBBuildUs = 0;        // 构建耗时（微秒，仅日志用）
+
+    // 深度缓冲的状态转换（DEPTH_WRITE <-> PIXEL_SHADER_RESOURCE）
+    void TransitionDepthBuffer(D3D12_RESOURCE_STATES newState);
+
+    ComPtr<ID3D12PipelineState> m_depthOnlyPipelineState;
+    ComPtr<ID3D12PipelineState> m_depthVisualizePipelineState;
+    bool m_depthPrepassEnabled = true;    // 按 P 切换
+    bool m_depthVisualizeEnabled = false; // 按 B 切换
+    // Main Pass 的深度状态（WRITE_ZERO + LESS_EQUAL vs WRITE_ALL + LESS）
+    // 是**烘焙进 PSO** 的，所以切换 prepass 时必须重建 PSO。
+    // 重建要等 GPU 用完旧的 PSO，因此用标志延迟到下一帧的安全点执行。
+    bool m_pipelineStateRebuildRequested = false;
+    D3D12_RESOURCE_STATES m_depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+
+    // 时间戳测量：剔除、Depth Pass、Main Pass 各自的 GPU 耗时
+    GPUProfiler m_gpuProfiler;
+    double m_avgGpuCullMs = 0.0;   // GPU 剔除 + 命令生成
+    double m_avgGpuDepthMs = 0.0;  // Depth Prepass
+    double m_avgGpuMainMs = 0.0;   // Main Pass
+    float m_nearPlane = 0.5f;
+    float m_farPlane = 500.0f;
 
     // ---- M8：CPU 视锥剔除 ----
     // 默认开启（M8 的主题就是只提交可见实例）；按 C 可切回「提交全部」，
@@ -322,4 +440,13 @@ private:
     DebugText m_debugText;
 
     Camera m_camera;
+
+    // ---- M14 验证：读回 HZB 各级的采样值，检查 Max reduction 的单调性 ----
+    // 这是一次性调试读回，**不参与**金字塔的生成流程（生成全在 GPU 上）。
+    bool CreateHZBVerifyReadback(ID3D12Device* device);
+    void VerifyHZBLevels();
+
+    ComPtr<ID3D12Resource> m_hzbVerifyReadback;
+    UINT m_hzbVerifyRowPitch = 0;
+    bool m_hzbVerifyDone = false;
 };

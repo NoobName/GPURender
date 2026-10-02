@@ -1,37 +1,50 @@
-// FrustumCullingCS.hlsl - GPU 视锥剔除 + Stream Compaction（M11）
+// FrustumCullingCS.hlsl - GPU 视锥剔除 + **LOD 选择** + Stream Compaction（M11 / M16）
 //
-// 一个线程处理一个实例：对它的世界空间包围球做 6 平面保守测试；
-// 若可见，就用一次原子加拿到「输出下标」，把实例 ID 写进紧凑列表。
-//
-// -----------------------------------------------------------------------------
-// 与 M10 的区别：不再写完整的布尔数组，而是写压缩后的索引列表
-// -----------------------------------------------------------------------------
-//   M10（未压缩）：                    M11（Stream Compaction）：
-//     visibilityFlags[N]                 visibleInstanceIndices[visibleCount]
-//     0 0 1 0 1 1 0 1                    2 4 5 7
-//     （N 个 uint）                      （visibleCount 个 uint）
-//
-//   代价：需要一次原子操作 + 输出顺序不确定（取决于线程完成顺序）
-//   收益：内存占用与下游读取量都正比于**可见数**而不是总数；
-//         下游 Pass（剔除、LOD、间接绘制）可以直接顺序遍历这个列表，
-//         不需要再跳过被剔除的槽位。
-//
-// 为什么这个任务适合 Compute Shader：
-//   剔除本身是「尴尬并行」的逐元素判定（M10 已论证）；
-//   压缩则更进一步 —— 它需要**跨线程协作**才能得到连续的输出下标，
-//   而原子操作 / 前缀和正是 GPU 上做这件事的两种手段。
-//   图形管线里没有别的阶段能既做批量判定、又做跨线程数据重排。
+// 一个线程处理一个实例，依次做三件事：
+//   ① 6 平面保守视锥测试；
+//   ② 通过测试后，按**投影后的屏幕尺寸**选一个 LOD 级；
+//   ③ 用一次原子加拿到「该 LOD 段内的输出下标」，把实例 ID 写进对应分段。
 //
 // -----------------------------------------------------------------------------
-// 本版用 Atomic（InterlockedAdd）
+// 为什么 LOD 选择放在这里，而不是单独开一个 Pass（M16）
 // -----------------------------------------------------------------------------
-//   每个可见实例调用一次 InterlockedAdd，拿到的返回值就是它独占的输出槽位。
-//   正确性依赖「原子加返回旧值」这个语义：N 次调用必然返回 0..N-1 的一个排列，
-//   因此不会有空洞、也不会互相覆盖。
+//   投影尺寸的计算需要 viewProj 与包围球 —— 这两样在视锥测试里**已经算过**。
+//   单独开一个 Pass 意味着把实例表再遍历一遍、矩阵再乘一遍，
+//   收益只是"代码分成两个文件"。合并之后：
 //
-//   瓶颈在于 **Atomic Contention**：所有线程争抢同一个地址。
-//   详见 LEARNING_NOTES M11 —— 这也是未来改用 Scan-Based Compaction 的动机。
-
+//     * 一次遍历同时产出「可见性」与「LOD」两个结果；
+//     * LOD 分段与视锥压缩共用同一次原子操作 —— 压缩代价没有翻倍。
+//
+// -----------------------------------------------------------------------------
+// 为什么输出要**按 LOD 分段**（M16 的核心）
+// -----------------------------------------------------------------------------
+//   间接绘制命令里能表达的几何选择只有三个字段：
+//       IndexCountPerInstance / StartIndexLocation / BaseVertexLocation
+//   它们是**每条命令**一份的。所以「让不同实例用不同 LOD」的唯一办法是
+//   **每个 LOD 一条命令**，每条带自己的几何偏移、自己那批实例。
+//
+//   于是输出布局变成：
+//
+//       gLODInstanceIndices[ lod * gSegmentCapacity + slot ] = instanceIndex
+//       gLODCounts[ lod * 4 ]                                = 该级实例数
+//
+//   命令生成 CS 随后为每个 lod 写一条命令，InstanceCount 取自 gLODCounts[lod]。
+//   CPU 全程不参与，也不知道任何一级有多少实例。
+//
+// -----------------------------------------------------------------------------
+// LOD 判据：投影后的屏幕尺寸
+// -----------------------------------------------------------------------------
+//   包围球中心投影到 NDC，半径按透视缩放换算，得到**该球投影直径占屏幕高度的比例**：
+//
+//       screenSize = 2 * r * P11 / sqrt(d^2 - r^2)
+//
+//   分母里的 sqrt 项是球到切平面的距离（M15 已推导）——
+//   保留它才能得到**包住整个球**的投影半径，与遮挡剔除的估计保持一致。
+//
+//   为什么不用世界空间距离：见 LEARNING_NOTES M16 Q1。
+//   要点是「视觉重要性 = 屏幕占比」，而屏幕占比同时取决于距离、FOV、
+//   分辨率与物体自身大小 —— 距离只是其中一个因子。
+//
 // -----------------------------------------------------------------------------
 // 与 src/Scene/InstanceData.h 逐字段对应（row_major 的约定见 M9）。
 // -----------------------------------------------------------------------------
@@ -44,27 +57,74 @@ struct InstanceData
     uint2    padding;         // offset 88 (8B) -> 结构体补齐到 96
 };
 
+// LOD 元数据（与 C++ 的 MeshLODRange 逐字段对应，stride = 32）
+struct MeshLODRange
+{
+    uint  indexOffset;          // 合并索引缓冲里的起始索引
+    uint  indexCount;
+    int   baseVertex;
+    uint  triangleCount;
+    float screenSizeThreshold;  // 屏幕尺寸低于此值 -> 切到下一级
+    uint  vertexCount;
+    uint  pad0;
+    uint  pad1;
+};
+
 StructuredBuffer<InstanceData> gInstances : register(t0);
+StructuredBuffer<MeshLODRange> gLODRanges : register(t2);
 
-// 压缩后的可见实例 ID 列表。第 i 个可见实例的 ID 位于 [i]。
-// 容量按最大实例数分配（最坏情况是全可见），实际有效长度由 gVisibleCount 给出。
-RWStructuredBuffer<uint> gVisibleInstanceIndices : register(u0);
+// 按 LOD 分段的压缩列表。第 lod 段从 lod * gSegmentCapacity 开始。
+RWStructuredBuffer<uint> gLODInstanceIndices : register(u0);
 
-// 可见实例计数器。用 ByteAddressBuffer 而不是 StructuredBuffer<uint>：
-//   * 它是一个 4 字节的「裸」缓冲，后续 ExecuteIndirect 的计数参数可以
-//     直接指向同一块内存（M12 会用到这一点）；
-//   * InterlockedAdd 在 ByteAddressBuffer 上以字节偏移寻址，语义更贴近硬件。
-RWByteAddressBuffer gVisibleCount : register(u1);
+// 每个 LOD 一个计数器：gLODCounts[lod * 4] = 该级实例数
+RWByteAddressBuffer gLODCounts : register(u1);
 
-// 视锥平面由 CPU 提取并归一化后经 root constants 传入（与 M10 一致）。
+// 每实例的 LOD（**仅用于可视化**）。
+//
+// 剔除逻辑本身不需要它 —— 但它让调试视图能把每个实例按所选 LOD 着色，
+// 从而一眼看出「投影尺寸判据是否按预期切换」。这是验证 LOD 最直观的手段。
+RWStructuredBuffer<uint> gInstanceLOD : register(u2);
+
 cbuffer FrustumConstants : register(b0)
 {
     float4 gFrustumPlanes[6]; // (nx, ny, nz, d)，法线已归一化
-    uint   gInstanceCount;
-    uint   gPad0;
-    uint   gPad1;
-    uint   gPad2;
+    float4x4 gViewProj;       // LOD 投影尺寸需要（cbuffer 默认 column-major -> mul(M, v)）
+
+    uint  gInstanceCount;
+    uint  gLODCount;
+    uint  gSegmentCapacity;
+    uint  gPad0;
+
+    float gProj11;   // 投影矩阵 [1][1]（y 缩放）
+    float gLODBias;  // 全局 LOD 偏置（正数 = 更偏向高精度）
+    uint  gPad1;
+    uint  gPad2;
 };
+
+// 按屏幕尺寸挑 LOD。
+//
+// 语义：threshold[i] 是「继续用第 i 级」的下界，低于它就用第 i+1 级。
+// 从前往后扫、满足条件就往后推进，因此即使阈值数组不是单调的也不会越界。
+uint SelectLOD(float screenSize)
+{
+    uint lod = 0u;
+    for (uint i = 0u; i + 1u < gLODCount; ++i)
+    {
+        if (screenSize < gLODRanges[i].screenSizeThreshold)
+        {
+            lod = i + 1u;
+        }
+    }
+    return lod;
+}
+
+void EmitInstance(uint lod, uint instanceIndex)
+{
+    uint outputIndex = 0u;
+    // 每级的计数器在自己的 4 字节槽位上，所以不同 LOD 之间**没有原子竞争**
+    gLODCounts.InterlockedAdd(lod * 4u, 1u, outputIndex);
+    gLODInstanceIndices[lod * gSegmentCapacity + outputIndex] = instanceIndex;
+}
 
 [numthreads(64, 1, 1)]
 void main(uint3 dispatchThreadId : SV_DispatchThreadID)
@@ -77,11 +137,11 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
     }
 
-    const float4 sphere = gInstances[index].boundingSphere;
+    const InstanceData instance = gInstances[index];
+    const float4 sphere = instance.boundingSphere;
     const float radius = sphere.w;
 
-    // 保守测试：只有球完全落在某个平面外侧才判为剔除。
-    // 算术写法与 CPU 侧逐字对应，便于两侧结果比对（见 M10）。
+    // ---- ① 保守视锥测试：只有球**完全**落在某个平面外侧才剔除 ----
     bool visible = true;
     [unroll]
     for (uint planeIndex = 0u; planeIndex < 6u; ++planeIndex)
@@ -98,21 +158,37 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     if (!visible)
     {
-        return; // 被剔除的实例不占输出槽位 —— 这正是压缩的意义
+        return; // 被剔除的实例不占任何 LOD 段的槽位
     }
 
-    // ---- Stream Compaction 的核心三行 ----
+    // ---- ② 按投影尺寸选 LOD ----
+    //
+    // 包围球中心的裁剪空间坐标；w 对标准透视投影就是视空间深度。
+    const float4 clip = mul(gViewProj, float4(sphere.xyz, 1.0));
+
+    uint lod = 0u;
+    if (clip.w > radius)
+    {
+        // 球到切平面的距离：用它作分母才能得到**包住整个球**的投影半径
+        const float denom = sqrt(max(clip.w * clip.w - radius * radius, 1e-6));
+        // NDC 的 y 半径 -> 「占屏幕高度比例」就是它的 2 倍
+        const float screenSize = 2.0 * radius * gProj11 / denom;
+        lod = SelectLOD(screenSize + gLODBias);
+    }
+    // 球包含相机时半径无定义 -> 用最高精度级（lod = 0），
+    // 与遮挡剔除在这里「保守放行」的选择一致：宁可画贵的，不可画错的。
+
+    // ---- ③ Stream Compaction 到该 LOD 的段 ----
     //
     //   InterlockedAdd(dest, value, originalValue)
-    //     dest          : 目标地址（这里用字节偏移 0）
-    //     value         : 要加的值（1）
-    //     originalValue : **加之前的旧值**，由硬件原子地返回
-    //
-    //   旧值恰好就是「本线程是第几个可见实例」，因此可以直接当输出下标。
-    //   原子性保证了 N 个线程拿到的旧值互不相同且构成 0..N-1，
-    //   所以既不会覆盖、也不会留下空洞。
-    uint outputIndex = 0u;
-    gVisibleCount.InterlockedAdd(0u, 1u, outputIndex);
+    //     originalValue 是**加之前的旧值**，恰好就是「本线程是该级第几个实例」，
+    //     可以直接当输出下标。原子性保证 N 次调用返回 0..N-1 的一个排列。
+    EmitInstance(lod, index);
 
-    gVisibleInstanceIndices[outputIndex] = index;
+    // 顺带记录每个实例选了哪一级（**仅用于可视化**）。
+    //
+    // 这里按**实例下标**直接写，与压缩无关 —— 被剔除的实例保留上一帧的值，
+    // 而它们本来就不参与绘制，所以不影响调试视图的正确性。
+    // 它让调试视图能把每个实例按所选 LOD 着色，一眼看出尺寸判据是否生效。
+    gInstanceLOD[index] = lod;
 }

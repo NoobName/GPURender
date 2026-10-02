@@ -9,7 +9,17 @@
 namespace
 {
 constexpr UINT kFrustumPlaneCount = 6;
-constexpr UINT kRootConstantDwords = kFrustumPlaneCount * 4u + 4u; // 6 个 float4 + count + 3 pad
+// b0 的布局（必须与 FrustumCullingCS.hlsl 的 FrustumConstants 逐字段一致）：
+//   [ 0, 24)  6 个 float4 视锥平面
+//   [24, 40)  float4x4 viewProj      （M16：LOD 投影尺寸用）
+//   [40]      instanceCount
+//   [41]      lodCount               （M16）
+//   [42]      segmentCapacity        （M16）
+//   [43]      pad
+//   [44]      proj11 (float)         （M16）
+//   [45]      lodBias (float)        （M16）
+//   [46][47]  pad
+constexpr UINT kRootConstantDwords = kFrustumPlaneCount * 4u + 16u + 8u; // = 48
 
 // readback 缓冲里两段数据的偏移，按 256 字节对齐
 constexpr UINT64 kReadbackAlignment = 256;
@@ -20,9 +30,12 @@ UINT64 AlignUp(UINT64 value, UINT64 alignment)
 }
 } // namespace
 
-bool GPUFrustumCuller::Initialize(ID3D12Device* device, std::uint32_t maxInstances)
+bool GPUFrustumCuller::Initialize(ID3D12Device* device, std::uint32_t maxInstances,
+                                  ID3D12DescriptorHeap* descriptorHeap, UINT descriptorSize,
+                                  UINT instanceLodUavSlot)
 {
     m_capacity = maxInstances;
+    m_instanceLodUavSlot = instanceLodUavSlot;
 
     // -------------------------------------------------------------------------
     // 1. 根签名：SRV 表 (t0) + UAV 表 (u0, u1) + root constants (b0)
@@ -31,7 +44,7 @@ bool GPUFrustumCuller::Initialize(ID3D12Device* device, std::uint32_t maxInstanc
     // u1 = visibleCount（ByteAddressBuffer 计数器）
     // 两者放在**同一张 UAV 表**里，因此描述符必须在堆里相邻。
     // -------------------------------------------------------------------------
-    D3D12_ROOT_PARAMETER params[3] = {};
+    D3D12_ROOT_PARAMETER params[5] = {};
 
     D3D12_DESCRIPTOR_RANGE srvRange = {};
     srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -61,8 +74,38 @@ bool GPUFrustumCuller::Initialize(ID3D12Device* device, std::uint32_t maxInstanc
     params[2].Constants.Num32BitValues = kRootConstantDwords;
     params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+    // 参数 3（M16）：LOD 元数据（t2）。
+    // 单独一张只有 1 个描述符的表 —— 它和实例表在堆里可以相距很远，
+    // 不需要为了「连续」而去调整全局槽位规划。
+    D3D12_DESCRIPTOR_RANGE lodRange = {};
+    lodRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    lodRange.NumDescriptors = 1; // t2
+    lodRange.BaseShaderRegister = 2;
+    lodRange.RegisterSpace = 0;
+    lodRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[3].DescriptorTable.NumDescriptorRanges = 1;
+    params[3].DescriptorTable.pDescriptorRanges = &lodRange;
+    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    // 参数 4（M16）：每实例 LOD 缓冲（u2，仅可视化用）。
+    //
+    // 单独一张只有 1 个描述符的表 —— 因为它和 u0/u1 在堆里不相邻
+    //（u0/u1 是 VisibleInstanceList 的，u2 是本类的），
+    // 而描述符表只能取连续区间。
+    D3D12_DESCRIPTOR_RANGE lodUavRange = {};
+    lodUavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    lodUavRange.NumDescriptors = 1; // u2
+    lodUavRange.BaseShaderRegister = 2;
+    lodUavRange.RegisterSpace = 0;
+    lodUavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[4].DescriptorTable.NumDescriptorRanges = 1;
+    params[4].DescriptorTable.pDescriptorRanges = &lodUavRange;
+    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-    rootDesc.NumParameters = 3;
+    rootDesc.NumParameters = 5;
     rootDesc.pParameters = params;
     rootDesc.NumStaticSamplers = 0;
     rootDesc.pStaticSamplers = nullptr;
@@ -135,11 +178,49 @@ bool GPUFrustumCuller::Initialize(ID3D12Device* device, std::uint32_t maxInstanc
         return false;
     }
 
-    std::cout << "[GPUFrustumCuller] Ready (M11 stream compaction): group size "
+    std::cout << "[GPUFrustumCuller] Ready (M11 stream compaction + M16 LOD): group size "
               << kThreadGroupSize << ", capacity " << m_capacity
               << " (indices "
               << (static_cast<double>(m_capacity) * sizeof(std::uint32_t) / 1024.0)
-              << " KB + 4 B counter)\n";
+              << " KB + 4 B counter per LOD segment)\n";
+
+    // ---- M16：每实例 LOD 缓冲（仅可视化）----
+    //
+    // DEFAULT heap + UAV，一个实例一个 uint，由剔除 CS 直接按实例下标写。
+    D3D12_HEAP_PROPERTIES lodHeap = {};
+    lodHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC lodDesc = {};
+    lodDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    lodDesc.Width = static_cast<UINT64>(maxInstances) * sizeof(std::uint32_t);
+    lodDesc.Height = 1;
+    lodDesc.DepthOrArraySize = 1;
+    lodDesc.MipLevels = 1;
+    lodDesc.SampleDesc.Count = 1;
+    lodDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    lodDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    if (FAILED(device->CreateCommittedResource(&lodHeap, D3D12_HEAP_FLAG_NONE, &lodDesc,
+                                               D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                               IID_PPV_ARGS(&m_instanceLOD))))
+    {
+        std::cerr << "[GPUFrustumCuller] Failed to create instance LOD buffer.\n";
+        return false;
+    }
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC lodUav = {};
+    lodUav.Format = DXGI_FORMAT_UNKNOWN; // StructuredBuffer
+    lodUav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    lodUav.Buffer.FirstElement = 0;
+    lodUav.Buffer.NumElements = maxInstances;
+    lodUav.Buffer.StructureByteStride = sizeof(std::uint32_t);
+    lodUav.Buffer.CounterOffsetInBytes = 0;
+    lodUav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE lodHandle = descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+    lodHandle.ptr += static_cast<SIZE_T>(instanceLodUavSlot) * descriptorSize;
+    device->CreateUnorderedAccessView(m_instanceLOD.Get(), nullptr, &lodUav, lodHandle);
+
     return true;
 }
 
@@ -147,8 +228,13 @@ void GPUFrustumCuller::Record(ID3D12GraphicsCommandList* cmd,
                               ID3D12DescriptorHeap* descriptorHeap,
                               UINT descriptorSize,
                               UINT instanceSrvSlot,
+                              UINT lodMetadataSrvSlot,
                               VisibleInstanceList& visibleList,
                               const DirectX::XMFLOAT4 planes[6],
+                              const DirectX::XMFLOAT4X4& viewProj,
+                              float proj11,
+                              float lodBias,
+                              std::uint32_t lodCount,
                               std::uint32_t instanceCount)
 {
     // ---- 1. 状态转换：两个缓冲都进入 UNORDERED_ACCESS ----
@@ -209,17 +295,33 @@ void GPUFrustumCuller::Record(ID3D12GraphicsCommandList* cmd,
     cmd->SetComputeRootSignature(m_rootSignature.Get());
     cmd->SetPipelineState(m_pipelineState.Get());
 
-    // 根参数 0：SRV 表 -> StructuredBuffer<InstanceData>
+    // ---- 4. 根参数 ----
+    //
+    // 根参数 0：SRV 表 -> t0 实例数据
     D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
     srvHandle.ptr += static_cast<UINT64>(instanceSrvSlot) * descriptorSize;
     cmd->SetComputeRootDescriptorTable(0, srvHandle);
 
-    // 根参数 1：UAV 表 -> u0 索引列表、u1 计数器（两者在堆里必须相邻）
+    // 根参数 1：UAV 表 -> u0 压缩列表、u1 每级计数器
     D3D12_GPU_DESCRIPTOR_HANDLE uavHandle = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
     uavHandle.ptr += static_cast<UINT64>(visibleList.GetIndicesUavSlot()) * descriptorSize;
     cmd->SetComputeRootDescriptorTable(1, uavHandle);
 
-    // 根参数 2：6 个归一化视锥平面 + instanceCount
+    // 根参数 3（M16）：SRV 表 -> t2 LOD 元数据
+    D3D12_GPU_DESCRIPTOR_HANDLE lodHandle = descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    lodHandle.ptr += static_cast<UINT64>(lodMetadataSrvSlot) * descriptorSize;
+    cmd->SetComputeRootDescriptorTable(3, lodHandle);
+
+    // 根参数 4（M16）：UAV 表 -> u2 每实例 LOD（可视化用）
+    D3D12_GPU_DESCRIPTOR_HANDLE instLodHandle =
+        descriptorHeap->GetGPUDescriptorHandleForHeapStart();
+    instLodHandle.ptr += static_cast<UINT64>(m_instanceLodUavSlot) * descriptorSize;
+    cmd->SetComputeRootDescriptorTable(4, instLodHandle);
+
+    // 根参数 2：b0 = 6 个归一化视锥平面 + viewProj + 实例数 + LOD 参数
+    //
+    // 布局必须与 FrustumCullingCS.hlsl 的 FrustumConstants 完全一致，
+    // 逐字段偏移见文件顶部 kRootConstantDwords 的注释。
     std::uint32_t constants[kRootConstantDwords] = {};
     for (UINT i = 0; i < kFrustumPlaneCount; ++i)
     {
@@ -228,7 +330,21 @@ void GPUFrustumCuller::Record(ID3D12GraphicsCommandList* cmd,
         std::memcpy(&constants[i * 4u + 2u], &planes[i].z, sizeof(float));
         std::memcpy(&constants[i * 4u + 3u], &planes[i].w, sizeof(float));
     }
-    constants[kFrustumPlaneCount * 4u] = instanceCount;
+
+    // viewProj：HLSL 侧是 float4x4（column-major 的 cbuffer 约定），
+    // 传进去的是行主序的 XMFLOAT4X4，所以 shader 里必须用 mul(M, v)。
+    std::memcpy(&constants[kFrustumPlaneCount * 4u], &viewProj, sizeof(DirectX::XMFLOAT4X4));
+
+    const UINT base = kFrustumPlaneCount * 4u + 16u;
+    constants[base + 0u] = instanceCount;
+    constants[base + 1u] = lodCount;
+    constants[base + 2u] = visibleList.GetCapacity(); // segmentCapacity
+    constants[base + 3u] = 0u;                        // pad
+    std::memcpy(&constants[base + 4u], &proj11, sizeof(float));
+    std::memcpy(&constants[base + 5u], &lodBias, sizeof(float));
+    constants[base + 6u] = 0u;
+    constants[base + 7u] = 0u;
+
     cmd->SetComputeRoot32BitConstants(2, kRootConstantDwords, constants, 0);
 
     // ---- 5. Dispatch：每 64 个实例一个线程组，向上取整 ----

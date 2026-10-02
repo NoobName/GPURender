@@ -29,6 +29,15 @@ struct AppConfig
     // M12：渲染路径。默认 CPU-Driven，保持与 M8~M11 的 benchmark 可比；
     // --gpu-driven 切到 ExecuteIndirect 路径。
     bool gpuDriven = false;
+    // M13：Depth Prepass 与深度可视化（默认 prepass 开、可视化关）
+    bool depthPrepass = true;
+    bool depthVisualize = false;
+    // M14：HZB
+    bool hzbVisualize = false;
+    int hzbMip = 0;
+    // M15：HZB 遮挡剔除（默认开；--no-occlusion 关闭以做 A/B 对比）
+    bool occlusion = true;
+    bool occlusionViz = false;
     bool valid = true;
 };
 
@@ -77,6 +86,39 @@ AppConfig ParseCommandLine(int argc, char** argv)
         {
             config.gpuDriven = true;
         }
+        else if (std::strcmp(arg, "--no-prepass") == 0)
+        {
+            config.depthPrepass = false;
+        }
+        else if (std::strcmp(arg, "--depth-viz") == 0)
+        {
+            config.depthVisualize = true;
+        }
+        else if (std::strcmp(arg, "--hzb-viz") == 0)
+        {
+            config.hzbVisualize = true;
+        }
+        else if (std::strcmp(arg, "--no-occlusion") == 0)
+        {
+            config.occlusion = false;
+        }
+        else if (std::strcmp(arg, "--occlusion-viz") == 0)
+        {
+            config.occlusionViz = true;
+        }
+        else if (std::strcmp(arg, "--hzb-mip") == 0 && i + 1 < argc)
+        {
+            const long value = std::strtol(argv[++i], nullptr, 10);
+            if (value >= 0)
+            {
+                config.hzbMip = static_cast<int>(value);
+                config.hzbVisualize = true; // 指定 mip 就意味着要看它
+            }
+            else
+            {
+                std::cerr << "[main] invalid --hzb-mip value\n";
+            }
+        }
         else if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0)
         {
             std::cout << "usage: GPUDrivenRenderer [--instances N] [--cull | --no-cull]\n"
@@ -87,6 +129,12 @@ AppConfig ParseCommandLine(int argc, char** argv)
                          "  --debug-viz N  0 = off, 1 = frustum, 2 = frustum + bounding spheres\n"
                          "  --compare-cull run one GPU-vs-CPU frustum culling comparison at startup\n"
                          "  --gpu-driven   use ExecuteIndirect (GPU-driven) instead of per-instance draws\n"
+                         "  --no-prepass   disable the depth prepass (single-pass rendering)\n"
+                         "  --depth-viz    visualize the depth buffer\n"
+                         "  --hzb-viz      visualize the HZB depth pyramid\n"
+                         "  --hzb-mip N    visualize HZB mip level N (implies --hzb-viz)\n"
+                         "  --no-occlusion disable HZB occlusion culling\n"
+                         "  --occlusion-viz visualize occlusion-culled instances\n"
                          "  (runtime keys: 1/2/3 = count, C = toggle culling, V = debug viz,\n"
                          "                 WASD/Arrows = rotate camera, Space = auto orbit, R = reset)\n";
             config.valid = false;
@@ -117,16 +165,22 @@ int main(int argc, char** argv)
         return EXIT_SUCCESS;
     }
 
-    Application app;
+    // Application 持有整个 Renderer（各帧资源、HZB、描述符等），
+    // 用堆分配而不是栈对象 —— 这是个好习惯，也让将来继续加成员时
+    // 不必担心主线程默认 1 MB 的栈预算。
+    auto app = std::make_unique<Application>();
 
-    if (!app.Initialize(config.instanceCount, config.useCpuCulling,
-                        config.cameraYawDegrees, config.debugViewMode,
-                        config.compareCulling, config.gpuDriven))
+    if (!app->Initialize(config.instanceCount, config.useCpuCulling,
+                         config.cameraYawDegrees, config.debugViewMode,
+                         config.compareCulling, config.gpuDriven,
+                         config.depthPrepass, config.depthVisualize,
+                         config.hzbVisualize, static_cast<std::uint32_t>(config.hzbMip),
+                         config.occlusion, config.occlusionViz))
     {
         return EXIT_FAILURE;
     }
 
-    app.Run();
-    app.Shutdown();
+    app->Run();
+    app->Shutdown();
     return EXIT_SUCCESS;
 }

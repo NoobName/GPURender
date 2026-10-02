@@ -49,6 +49,15 @@ using Microsoft::WRL::ComPtr;
 class VisibleInstanceList
 {
 public:
+    // segments：把列表切成几段（M16 的 LOD 用）。
+    //
+    //   1 = 传统行为（M11~M15）：整个缓冲就是一段，计数器 1 个 uint。
+    //   N = 按 LOD 分段：第 i 段占 [i*capacity, (i+1)*capacity)，
+    //       计数器是 N 个 uint，第 i 个在字节偏移 i*4。
+    //
+    //   为什么需要分段：间接绘制命令的 InstanceCount / StartIndex / BaseVertex
+    //   是**每条命令一份**的，所以「让不同实例用不同 LOD」只能靠
+    //   「每个 LOD 一条命令 + 每级一份实例列表」。
     bool Initialize(ID3D12Device* device,
                     std::uint32_t maxInstances,
                     ID3D12DescriptorHeap* descriptorHeap,
@@ -56,7 +65,8 @@ public:
                     UINT indicesUavSlot,
                     UINT countUavSlot,
                     UINT indicesSrvSlot,
-                    UINT countSrvSlot);
+                    UINT countSrvSlot,
+                    std::uint32_t segments = 1);
 
     ID3D12Resource* GetIndexBuffer() const { return m_indices.Get(); }
     ID3D12Resource* GetCountBuffer() const { return m_count.Get(); }
@@ -69,7 +79,19 @@ public:
     UINT GetIndicesSrvSlot() const { return m_indicesSrvSlot; }
     UINT GetCountSrvSlot() const { return m_countSrvSlot; }
 
+    // 单段容量（最坏情况下「一段里能放多少实例」）
     std::uint32_t GetCapacity() const { return m_capacity; }
+    // 段数（1 = 不分段）
+    std::uint32_t GetSegmentCount() const { return m_segments; }
+    // 整个索引缓冲能放的实例总数
+    std::uint32_t GetTotalCapacity() const { return m_capacity * m_segments; }
+    // 第 segment 段在索引缓冲里的元素偏移
+    std::uint32_t GetSegmentOffset(std::uint32_t segment) const
+    {
+        return segment * m_capacity;
+    }
+    // 第 segment 段的计数器字节偏移
+    static std::uint32_t GetCountOffset(std::uint32_t segment) { return segment * 4u; }
 
     // 元素步长（字节）
     static constexpr UINT GetIndexStride() { return sizeof(std::uint32_t); }
@@ -92,6 +114,7 @@ private:
     ComPtr<ID3D12DescriptorHeap> m_clearHeap;
 
     std::uint32_t m_capacity = 0;
+    std::uint32_t m_segments = 1;
     UINT m_indicesUavSlot = 0;
     UINT m_countUavSlot = 0;
     UINT m_indicesSrvSlot = 0;
