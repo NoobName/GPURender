@@ -1,4 +1,4 @@
-#include "Application.h"
+﻿#include "Application.h"
 
 #include <windows.h>
 
@@ -6,7 +6,7 @@ bool Application::Initialize(std::uint32_t initialInstanceCount, bool useCpuCull
                              float cameraYawDegrees, int debugViewMode, bool compareCulling,
                              bool gpuDriven, bool depthPrepass, bool depthVisualize,
                              bool hzbVisualize, std::uint32_t hzbMip,
-                             bool occlusion, bool occlusionViz)
+                             bool occlusion, bool occlusionViz, bool meshShader)
 {
     // 1. D3D12 上下文（Debug Layer -> Factory -> Adapter -> Device）
     if (!m_d3d12.Initialize())
@@ -29,7 +29,12 @@ bool Application::Initialize(std::uint32_t initialInstanceCount, bool useCpuCull
                                initialInstanceCount, useCpuCulling,
                                cameraYawDegrees, debugViewMode, compareCulling, gpuDriven,
                                depthPrepass, depthVisualize, hzbVisualize, hzbMip,
-                               occlusion, occlusionViz))
+                               occlusion, occlusionViz,
+                               // M18：Feature Fallback 的入口。
+                               // 只有查询到 Tier 1 才允许进入 Mesh Shader 模式；
+                               // 否则 M 键会跳过它，不会尝试创建 PSO 或 DispatchMesh。
+                               m_d3d12.GetCapabilities().meshShaderTier >= D3D12_MESH_SHADER_TIER_1,
+                               meshShader))
     {
         return false;
     }

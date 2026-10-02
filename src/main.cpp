@@ -38,6 +38,9 @@ struct AppConfig
     // M15：HZB 遮挡剔除（默认开；--no-occlusion 关闭以做 A/B 对比）
     bool occlusion = true;
     bool occlusionViz = false;
+    // M18：以 Mesh Shader 模式启动。
+    // 只表达「意图」—— 硬件不支持时由 Renderer 静默退回默认模式。
+    bool meshShader = false;
     bool valid = true;
 };
 
@@ -101,6 +104,10 @@ AppConfig ParseCommandLine(int argc, char** argv)
         else if (std::strcmp(arg, "--no-occlusion") == 0)
         {
             config.occlusion = false;
+        }
+        else if (std::strcmp(arg, "--mesh-shader") == 0)
+        {
+            config.meshShader = true;
         }
         else if (std::strcmp(arg, "--occlusion-viz") == 0)
         {
@@ -175,7 +182,8 @@ int main(int argc, char** argv)
                          config.compareCulling, config.gpuDriven,
                          config.depthPrepass, config.depthVisualize,
                          config.hzbVisualize, static_cast<std::uint32_t>(config.hzbMip),
-                         config.occlusion, config.occlusionViz))
+                         config.occlusion, config.occlusionViz,
+        config.meshShader))
     {
         return EXIT_FAILURE;
     }

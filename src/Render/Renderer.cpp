@@ -21,6 +21,30 @@ using namespace DirectX;
 
 namespace
 {
+// sphere.obj 的面绕序与导出的外向顶点法线相反。先统一索引，再生成 meshlet
+// 和剔除数据，保证光栅化背面与法线锥描述的是同一侧表面。
+std::size_t AlignSphereWindingWithNormals(MeshData& mesh)
+{
+    std::size_t reversed = 0;
+    for (std::size_t i = 0; i + 2 < mesh.indices.size(); i += 3)
+    {
+        const MeshVertex& a = mesh.vertices[mesh.indices[i]];
+        const MeshVertex& b = mesh.vertices[mesh.indices[i + 1]];
+        const MeshVertex& c = mesh.vertices[mesh.indices[i + 2]];
+        const XMVECTOR faceNormal = XMVector3Cross(
+            XMLoadFloat3(&b.position) - XMLoadFloat3(&a.position),
+            XMLoadFloat3(&c.position) - XMLoadFloat3(&a.position));
+        const XMVECTOR outwardNormal = XMLoadFloat3(&a.normal) +
+            XMLoadFloat3(&b.normal) + XMLoadFloat3(&c.normal);
+        if (XMVectorGetX(XMVector3Dot(faceNormal, outwardNormal)) < 0.0f)
+        {
+            std::swap(mesh.indices[i + 1], mesh.indices[i + 2]);
+            ++reversed;
+        }
+    }
+    return reversed;
+}
+
 // CPU/GPU 路径必须使用相同的光栅化规则，才能公平比较提交方式。
 // 保持基线的双面渲染；近距离或从模型内部观察时，背面也参与遮挡。
 D3D12_RASTERIZER_DESC MeshRasterizerState()
@@ -83,12 +107,20 @@ bool Renderer::Initialize(ID3D12Device* device, IDXGIFactory4* factory, HWND hwn
                           bool compareCullingAtStartup, bool gpuDriven,
                           bool depthPrepass, bool depthVisualize,
                           bool hzbVisualize, std::uint32_t hzbMip,
-                          bool occlusion, bool occlusionViz)
+                          bool occlusion, bool occlusionViz, bool meshShaderSupported,
+                          bool startInMeshShaderMode)
 {
     m_cpuCullingEnabled = useCpuCulling;
     m_cameraYawDegrees = cameraYawDegrees;
     m_debugViewMode = debugViewMode;
     m_renderMode = gpuDriven ? RenderMode::GpuDriven : RenderMode::CpuDriven;
+    m_meshShaderSupported = meshShaderSupported;
+    // --mesh-shader 只表达「想以这个模式启动」的意愿；真正的可用性由能力查询决定。
+    // 不支持时**静默退回**默认模式，而不是启动失败。
+    if (startInMeshShaderMode && m_meshShaderSupported)
+    {
+        m_renderMode = RenderMode::MeshShader;
+    }
     m_depthPrepassEnabled = depthPrepass;
     m_depthVisualizeEnabled = depthVisualize;
     m_hzbVisualizeEnabled = hzbVisualize;
@@ -134,6 +166,28 @@ bool Renderer::Initialize(ID3D12Device* device, IDXGIFactory4* factory, HWND hwn
     if (!CreateDepthOnlyPipelineState(device)) return false;      // M13
     if (!CreateDepthVisualizePipelineState(device)) return false; // M13
     if (!CreateHZBVisualizePipelineState(device)) return false;   // M14
+
+    // M18：Mesh Shader 路径。**只在硬件支持时创建** —— 这就是 Feature Fallback：
+    // 不支持时既不创建 PSO 也不创建根签名，M 键也会跳过这个模式，
+    // 而不是创建一堆用不上的对象然后在运行时报错。
+    if (m_meshShaderSupported)
+    {
+        if (!CreateMeshShaderRootSignature(device))
+        {
+            std::cerr << "[Renderer] Mesh Shader root signature failed; disabling Mesh Shader mode.\n";
+            m_meshShaderSupported = false;
+        }
+        else if (!CreateMeshShaderPipelineState(device))
+        {
+            std::cerr << "[Renderer] Mesh Shader PSO failed; disabling Mesh Shader mode.\n";
+            m_meshShaderSupported = false;
+        }
+    }
+    else
+    {
+        std::cout << "[Renderer] Mesh Shader not supported on this device; "
+                     "Mesh Shader mode unavailable (CPU-Driven / ExecuteIndirect remain).\n";
+    }
 
     // M14：层级深度金字塔。
     // 必须放在 CreateDepthBuffer 之后 —— 它的第 0 级是从深度缓冲降采样得到的。
@@ -466,12 +520,23 @@ void Renderer::Render()
 
     // M15/M16：遮挡剔除是否生效（M16 的 LOD 选择需要提前知道这一点，
     // 因为两者目前不能叠加 —— 见 M16 Limitation）。
-    const bool occlusionActive = m_occlusionEnabled && m_depthPrepassEnabled && totalCount > 0;
+    //
+    // M18：Mesh Shader 模式下所有这些「实例相关」的 pass 全部跳过 —— 见下方 meshShaderMode。
+    const bool meshShaderMode = (m_renderMode == RenderMode::MeshShader && m_meshShaderSupported);
+    const bool instancePasses = !meshShaderMode;
+
+
+    const bool occlusionActive =
+        instancePasses && m_occlusionEnabled && m_depthPrepassEnabled && totalCount > 0;
 
     // 10a. GPU 视锥剔除 + LOD 选择 + Stream Compaction：每线程一个实例，
     //      结果写进「压缩后的可见索引列表 + 计数器」。
     //      Dispatch 的线程组数 = ceil(instanceCount / 64)，见 GPUFrustumCuller。
-    if (totalCount > 0)
+    //
+    // M18：Mesh Shader 模式画的是 meshlet 化的球体，**不消费实例场景** ——
+    //      所以这一步（以及下面整条实例管线）都被跳过。否则会白算一遍剔除与命令，
+    //      而结果没有任何消费者。
+    if (totalCount > 0 && instancePasses)
     {
         // M16：剔除 CS 现在同时做 LOD 选择，所以要额外传 viewProj 与投影参数。
         const XMMATRIX cullProjection = m_camera.GetProjection();
@@ -495,7 +560,7 @@ void Renderer::Render()
     //
     //      它读 LOD 元数据 + 每级的实例计数器，写 indirect argument buffer。
     //      实际画多少实例、用哪一级几何，**两个决定都在 GPU 上**。
-    if (totalCount > 0)
+    if (totalCount > 0 && instancePasses)
     {
         m_indirectCommands.Record(m_commandList.Get(), m_srvHeap.Get(), m_srvDescriptorSize,
                                   m_visibleList, kLODMetadataSrvSlot);
@@ -534,7 +599,7 @@ void Renderer::Render()
     //      它排在 Main Pass 之前，把最近表面的深度先写进深度缓冲。
     //      Main Pass 随后以 LESS_EQUAL + 不写深度的方式复用它，
     //      被遮挡的片元在**像素着色之前**就被 Early-Z 丢弃。
-    if (m_depthPrepassEnabled && totalCount > 0)
+    if (instancePasses && m_depthPrepassEnabled && totalCount > 0)
     {
         RecordDepthPrepass();
     }
@@ -556,7 +621,13 @@ void Renderer::Render()
     //      为什么放在这里：HZB 描述的是「本帧的不透明几何深度」，
     //      所以必须在深度 Pass **之后**、Main Pass 之前（下一帧做遮挡剔除时
     //      用的就是这个金字塔）。
-    RecordHZBBuild();
+    //
+    // M18：Mesh Shader 模式下深度缓冲里没有实例场景的几何（那个 pass 被跳过了），
+    //       构建出来的 HZB 不会被任何消费者使用，所以一并跳过。
+    if (instancePasses)
+    {
+        RecordHZBBuild();
+    }
 
     // 10h. **M15：HZB 遮挡剔除**。
     //
@@ -567,7 +638,10 @@ void Renderer::Render()
     //        Depth Prepass 画的是**全部候选**（它的目的只是把深度铺出来）；
     //        遮挡剔除之后 Main Pass 只画**真正可见**的那些。
     //      所以省下的是 Main Pass 的绘制量（顶点处理 + 像素着色）。
-    RecordOcclusionCulling(m_frameIndex);
+    if (instancePasses)
+    {
+        RecordOcclusionCulling(m_frameIndex);
+    }
 
     // 10i. **第二次命令生成**：这次为「遮挡剔除后的可见列表」写出命令。
     //
@@ -589,9 +663,22 @@ void Renderer::Render()
     // 10j. Main Pass 的渲染目标绑定（Depth Prepass 时绑定的是 0 个 RTV）。
     m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
-    if (m_renderMode == RenderMode::GpuDriven)
+    if (m_renderMode == RenderMode::MeshShader && m_meshShaderSupported &&
+        m_commandList6 != nullptr)
+    {
+        // M18：Mesh Shader 路径。
+        //
+        // 这条分支取代了整个 CPU 侧的几何提交循环 ——
+        // 场景里被 meshlet 化的那个网格（sphere.obj）由 GPU 的 Mesh Shader 自己组装。
+        // 注意它渲染的是**球体**，而不是实例化的立方体场景：
+        // meshlet 预处理目前只对 sphere.obj 做了（见 M17 的 Limitation L2），
+        // 所以这个模式的语义是「用 Mesh Shader 画那个 meshlet 化的网格」。
+        RecordMeshShaderDraw(viewProj);
+    }
+    else if (m_renderMode == RenderMode::GpuDriven)
     {
         m_stats.gpuDriven = true;
+        m_stats.meshShaderPath = false;
         m_stats.submittedDrawCalls = 0;    // CPU 侧一次 draw 都没有提交
         m_stats.indirectExecuteCount = 1;  // 只有一次 ExecuteIndirect
 
@@ -610,6 +697,7 @@ void Renderer::Render()
     else
     {
         m_stats.gpuDriven = false;
+        m_stats.meshShaderPath = false;
         m_stats.submittedDrawCalls = submitCount;
         m_stats.indirectExecuteCount = 0;
 
@@ -675,6 +763,23 @@ void Renderer::Render()
     {
         m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
         m_commandList->SetPipelineState(m_uiPipelineState.Get());
+
+        // **IA 拓扑必须在这里自己设一次，不能依赖别的 pass 顺手设过。**
+        //
+        // 这是一处被 M18 暴露出来的潜伏 bug：
+        //   `DrawInstanced` 需要 IA 拓扑有效，而 D3D12 的拓扑**不在 PSO 里**，
+        //   只能由 `IASetPrimitiveTopology` 设置，且 command list Reset 后会失效。
+        //   在此之前 UI 一直「借用」实例绘制或 Depth Prepass 设好的拓扑 ——
+        //   那些 pass 都在它之前跑，所以从来没暴露过。
+        //
+        //   M18 的 Mesh Shader 模式下，实例相关的 pass 全部被跳过
+        //   （它们画的几何与 meshlet 球体无关），于是整帧**没有任何人**设置拓扑。
+        //   结果是 Debug Layer 在 DrawInstanced 上直接中断，进程异常退出
+        //   （故障模块 KERNELBASE.dll，**没有任何 D3D12 错误消息** —— 极难定位）。
+        //
+        // 教训：**每个绘制单元应当自己声明它依赖的状态**，
+        // 而不是依赖「正好前面有人设过」。
+        m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         D3D12_GPU_DESCRIPTOR_HANDLE fontSrv = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
         fontSrv.ptr += static_cast<UINT64>(m_debugText.GetSrvIndex()) * m_srvDescriptorSize;
@@ -868,6 +973,15 @@ bool Renderer::CreateCommandList(ID3D12Device* device)
     {
         return false;
     }
+
+    // M18：DispatchMesh 在 ID3D12GraphicsCommandList6 上。命令列表对象本身早已
+    // 实现该接口（只要系统装了较新的 D3D12 runtime），所以这里查询一次并缓存。
+    // 查询失败不视为致命错误 —— 只是 Mesh Shader 模式不可用。
+    if (FAILED(m_commandList.As(&m_commandList6)))
+    {
+        m_commandList6.Reset();
+    }
+
     return SUCCEEDED(m_commandList->Close());
 }
 
@@ -1212,6 +1326,105 @@ bool Renderer::CreateAssets(ID3D12Device* device)
     if (!CreateLODChain(device, uploadList.Get(), stagingResources))
     {
         return false;
+    }
+
+    // ---- M17：Meshlet 预处理（Asset Preprocessing / Load Time）----
+    //
+    // **为什么放在这里，而不是每帧或第一次绘制时：**
+    //   ComputeMeshlets 是贪心聚类，要反复计算三角形评分并排序；对一个上万三角形的
+    //   网格来说是毫秒级的 CPU 工作。放进帧循环没有任何意义，而放进「首次使用时」
+    //   会把一次性的卡顿藏在渲染路径里。加载期是它唯一合理的位置。
+    //
+    //   注意这里**没有**任何自己的聚类代码 —— 全部交给 DirectXMesh 的
+    //   ComputeMeshlets + ComputeCullData（用户明确要求不自己实现聚类算法）。
+    //
+    // 用 sphere.obj 而不是 M16 那个程序化细分立方体：验收要求是
+    //   "Imported Mesh 成功拆分为 Meshlets"，所以要用一个**真正从文件导入**的网格。
+    //   球体也是最适合观察 meshlet 划分的形体 —— 各向同性，不存在立方体那种
+    //   大平面导致聚类结果全部贴在一起的情况。
+    {
+        const std::string meshletSourcePath = GetExecutableDirectory() + "assets/sphere.obj";
+
+        MeshData meshletSource;
+        std::string meshletError;
+        const bool sphereLoaded = LoadObjFromFile(meshletSourcePath, meshletSource, meshletError);
+        if (sphereLoaded)
+        {
+            const std::size_t reversed = AlignSphereWindingWithNormals(meshletSource);
+            std::cout << "[Renderer] Sphere winding: aligned " << reversed
+                      << " triangles with outward normals.\n";
+        }
+        if (!sphereLoaded)
+        {
+            // 不致命：没有 meshlet 不影响 M1~M16 的任何功能。
+            // 但要明确报出来，避免「以为跑了其实没跑」。
+            std::cerr << "[Renderer] Meshlet source mesh unavailable: " << meshletError << "\n";
+        }
+        else if (!m_meshletBuilder.Build(meshletSource))
+        {
+            std::cerr << "[Renderer] Meshlet preprocessing failed; continuing without meshlets.\n";
+        }
+        else if (!m_meshletResources.Initialize(device, uploadList.Get(), m_meshletBuilder,
+                                                m_srvHeap.Get(), m_srvDescriptorSize,
+                                                kMeshletSrvSlot, stagingResources))
+        {
+            std::cerr << "[Renderer] Meshlet GPU upload failed; continuing without meshlets.\n";
+        }
+        else
+        {
+            m_meshletVisualizationEnabled = true;
+
+            // -----------------------------------------------------------------
+            // M18：把同一个球体也做成**传统 indexed 网格**
+            //
+            // 这是验证「同一个 Mesh 可以通过 Mesh Shader 正确渲染」的必要条件：
+            // 必须有同源的参照物。两条路径（Mesh Shader / 传统 indexed）画同一个球，
+            // 按 M 切换时画面应当一致 —— 否则「正确」无从判断。
+            //
+            // 注意 Mesh Shader **只用它的顶点缓冲**（通过 SRV 读）；
+            // 索引缓冲是留给传统路径对照渲染用的。
+            // -----------------------------------------------------------------
+            if (!m_meshletSphereMesh.Initialize(device, uploadList.Get(), meshletSource, stagingResources))
+            {
+                std::cerr << "[Renderer] Failed to create sphere GPU mesh for meshlet path.\n";
+                m_meshletVisualizationEnabled = false;
+            }
+            else
+            {
+                m_meshletSphereVertexCount = static_cast<std::uint32_t>(meshletSource.vertices.size());
+
+                // 顶点 SRV：StructuredBuffer<MeshVertex>，stride 32。
+                // Mesh Shader 靠它读取顶点 —— 没有 Input Assembler 参与。
+                D3D12_SHADER_RESOURCE_VIEW_DESC vertexSrv = {};
+                vertexSrv.Format                     = DXGI_FORMAT_UNKNOWN; // StructuredBuffer
+                vertexSrv.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+                vertexSrv.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                vertexSrv.Buffer.FirstElement        = 0;
+                vertexSrv.Buffer.NumElements         = m_meshletSphereVertexCount;
+                vertexSrv.Buffer.StructureByteStride = sizeof(MeshVertex);
+                vertexSrv.Buffer.Flags                = D3D12_BUFFER_SRV_FLAG_NONE;
+
+                D3D12_CPU_DESCRIPTOR_HANDLE vertexHandle =
+                    m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+                vertexHandle.ptr += static_cast<SIZE_T>(kMeshletVertexSrvSlot) * m_srvDescriptorSize;
+                device->CreateShaderResourceView(m_meshletSphereMesh.GetVertexBufferResource(),
+                                                 &vertexSrv, vertexHandle);
+
+                std::cout << "[Renderer] Sphere GPU mesh for meshlet path: "
+                          << m_meshletSphereVertexCount << " verts / "
+                          << (m_meshletSphereMesh.GetIndexCount() / 3) << " tris"
+                          << "  (vertex SRV at slot " << kMeshletVertexSrvSlot << ")\n";
+
+                // M19：AS 剔除统计缓冲。
+                // 必须在 meshlet 数据就绪之后创建 —— 它的大小取决于 meshlet 数
+                // （16 字节计数器 + 每 meshlet 4 字节状态）。
+                if (!CreateMeshletCullStats(device, m_meshletBuilder.GetStats().meshletCount))
+                {
+                    std::cerr << "[Renderer] Meshlet cull stats unavailable; "
+                                 "AS statistics will not be displayed.\n";
+                }
+            }
+        }
     }
 
     // 描述符槽位分配见 Renderer.h 的 kXxxSrvSlot 常量
@@ -1587,6 +1800,345 @@ bool Renderer::CreateGpuDrivenPipelineState(ID3D12Device* device)
 
     return SUCCEEDED(device->CreateGraphicsPipelineState(&desc,
                                                          IID_PPV_ARGS(&m_gpuDrivenPipelineState)));
+}
+
+// ===========================================================================
+// M18：Mesh Shader 渲染路径
+// ===========================================================================
+
+namespace
+{
+// -----------------------------------------------------------------------------
+// 手写等价于 d3dx12.h 的 CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT
+// -----------------------------------------------------------------------------
+// **为什么必须用 pipeline state stream，而不能用 D3D12_GRAPHICS_PIPELINE_STATE_DESC：**
+//
+//   旧的 desc 结构里根本没有 Mesh Shader 字段。要让 PSO 携带 MS/AS 字节码，
+//   只能用「子对象流」这种可扩展表示：一串 { 子对象类型; 数据; } 的记录。
+//
+//   本项目刻意不引入 d3dx12.h（全项目手写 D3D12 结构，见 CMakeLists 的说明），
+//   所以这里用 20 行模板补上同等能力，而不是为一个 PSO 拉进整个 helper 头。
+//
+//   `alignas(void*)` 是关键：子对象流要求每个子对象的**数据**落在 8 字节边界上。
+//   类型字段只占 4 字节，靠结构体整体的 8 字节对齐让编译器自动补 4 字节 padding，
+//   数据就自然对齐了 —— 这正是 d3dx12.h 的做法。
+// -----------------------------------------------------------------------------
+// **关于 C4324「结构因对齐说明符而被填充」：**
+//   这个警告对绝大多数类型都会触发（只要 T 的天然对齐小于 8），而这里的填充
+//   恰恰是**协议要求**，不是疏忽。Release 全量构建会报出其中两条
+//   （D3D12_BLEND_DESC 与 DXGI_SAMPLE_DESC 的天然对齐只有 4）。
+//   所以这里显式抑制并留下这段说明，而不是改成别的写法 ——
+//   去掉 padding 会让子对象流失效，那才是真正的 bug。
+#pragma warning(push)
+#pragma warning(disable : 4324) // 结构因对齐说明符而被填充 —— 这里正是所需
+template <typename T, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type>
+struct alignas(void*) PsoStreamSubobject
+{
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    T                                   data;
+};
+#pragma warning(pop)
+} // namespace
+
+namespace
+{
+// M19：资源状态转换的辅助构造。
+//
+// 项目约定「每个 barrier 都必须能说清 StateBefore / StateAfter」——
+// 这个函数把这两个值变成**必填参数**，从而在调用点强制写清楚，
+// 比三处重复的 8 行样板更不容易漏掉。
+D3D12_RESOURCE_BARRIER MakeTransitionBarrier(ID3D12Resource* resource,
+                                             D3D12_RESOURCE_STATES stateBefore,
+                                             D3D12_RESOURCE_STATES stateAfter)
+{
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource   = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = stateBefore;
+    barrier.Transition.StateAfter  = stateAfter;
+    return barrier;
+}
+} // namespace
+
+bool Renderer::CreateMeshShaderRootSignature(ID3D12Device* device)
+{
+    D3D12_ROOT_PARAMETER params[3] = {};
+
+    // 参数 0：root constants b0（M19 起扩展到 52 个 DWORD）
+    //   float4x4 worldViewProj        (16)  MS 用
+    //   float4   color                ( 4)  PS 用
+    //   float4   frustumPlanes[6]     (24)  AS 视锥剔除用（M19 新增）
+    //   float4   eyePosition          ( 4)  AS 法线锥剔除用（M19 新增）
+    //   uint     meshletCount         ( 1)
+    //   uint     coneCullingEnabled   ( 1)  AS 开关，便于 A/B（M19 新增）
+    //   uint     frustumCullingEnabled( 1)  AS 开关（M19 新增）
+    //   uint     pad0                 ( 1)
+    //                                  = 52
+    //
+    // 上限是 64 个 DWORD，还有余量。
+    // 继续用 root constants 而不是 CBV：数据量小、每帧只改一次，
+    // 直接塞进命令列表比维护常量缓冲 + 每帧上传更省。
+    params[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.ShaderRegister  = 0;
+    params[0].Constants.RegisterSpace   = 0;
+    params[0].Constants.Num32BitValues  = 52;
+    params[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
+
+    // 参数 1：SRV 表 t0..t4 —— **一张表绑定全部 5 个 meshlet 缓冲**
+    //
+    // 描述符表只能取堆里的连续区间，所以这 5 个 SRV 被刻意安排在槽位 44..48
+    //（见 Renderer.h 的 kMeshletSrvSlot / kMeshletVertexSrvSlot）。
+    D3D12_DESCRIPTOR_RANGE srvRange = {};
+    srvRange.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors                    = 5;
+    srvRange.BaseShaderRegister                = 0;
+    srvRange.RegisterSpace                     = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    params[1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable.NumDescriptorRanges = 1;
+    params[1].DescriptorTable.pDescriptorRanges   = &srvRange;
+    params[1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+
+    // 参数 2：**root UAV**（M19 新增）—— AS 写剔除统计与每 meshlet 状态
+    //
+    // 用 root UAV 而不是描述符表：只有一个资源，而且 root descriptor 连
+    // 描述符堆都不需要，直接传 GPU 虚拟地址，是最省的绑定方式。
+    // 只有 AS 需要写它，所以可见性限定为 AMPLIFICATION（这是少数能精确限定
+    // 阶段可见性的场合 —— MS/PS 都不该有写入权）。
+    params[2].ParameterType           = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[2].Descriptor.ShaderRegister = 0;
+    params[2].Descriptor.RegisterSpace  = 0;
+    params[2].ShaderVisibility          = D3D12_SHADER_VISIBILITY_AMPLIFICATION;
+
+    D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+    rootDesc.NumParameters = 3;
+    rootDesc.pParameters   = params;
+    rootDesc.NumStaticSamplers = 0;
+    rootDesc.pStaticSamplers   = nullptr;
+
+    // Mesh Shader 存在时，VS/HS/DS/GS 这些传统几何阶段**在 PSO 里根本不存在**。
+    // 显式 DENY 掉它们的根访问是官方推荐做法：驱动可以据此省掉一部分绑定校验工作，
+    // 而且如果哪天误绑了这些阶段，会得到明确的报错而不是静默行为。
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS |
+                     D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+                     D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+                     D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+
+    ComPtr<ID3DBlob> signature;
+    ComPtr<ID3DBlob> error;
+    if (FAILED(D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                           &signature, &error)))
+    {
+        std::cerr << "[Renderer] Mesh Shader root signature serialization failed";
+        if (error)
+        {
+            std::cerr << ": " << static_cast<const char*>(error->GetBufferPointer());
+        }
+        std::cerr << "\n";
+        return false;
+    }
+
+    if (FAILED(device->CreateRootSignature(0, signature->GetBufferPointer(),
+                                           signature->GetBufferSize(),
+                                           IID_PPV_ARGS(&m_meshShaderRootSignature))))
+    {
+        std::cerr << "[Renderer] Failed to create Mesh Shader root signature.\n";
+        return false;
+    }
+
+    std::cout << "[Renderer] Mesh Shader root signature ready"
+              << " (b0 = 52 root constants, t0..t4 = 1 table over slots "
+              << kMeshletSrvSlot << ".." << kMeshletVertexSrvSlot
+              << ", u0 = root UAV for cull stats)\n";
+    return true;
+}
+
+bool Renderer::CreateMeshShaderPipelineState(ID3D12Device* device)
+{
+    // Mesh Shader 需要 Shader Model 6.5+ 的 target profile。
+    // 本机实测 HighestShaderModel = 6.8，满足。
+    std::string errorMsg;
+
+    // M19：Amplification Shader —— 插在 MS 之前做 meshlet 级剔除。
+    // 目标 profile 是 as_6_5（与 ms_6_5 同属 Shader Model 6.5）。
+    std::vector<std::uint8_t> asBytecode = ShaderCompiler::Compile(
+        L"MeshletAS.hlsl", L"main", L"as_6_5", errorMsg);
+    if (asBytecode.empty())
+    {
+        std::cerr << "[Renderer] Amplification Shader compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+    std::vector<std::uint8_t> msBytecode = ShaderCompiler::Compile(
+        L"MeshletMS.hlsl", L"main", L"ms_6_5", errorMsg);
+    if (msBytecode.empty())
+    {
+        std::cerr << "[Renderer] Mesh Shader compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+
+    std::vector<std::uint8_t> psBytecode = ShaderCompiler::Compile(
+        L"MeshletPS.hlsl", L"main", L"ps_6_0", errorMsg);
+    if (psBytecode.empty())
+    {
+        std::cerr << "[Renderer] Meshlet PS compile failed:\n" << errorMsg << "\n";
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // 组装 pipeline state stream
+    //
+    // 注意这里**没有 InputLayout** —— Mesh Shader 不存在 Input Assembler 阶段，
+    // 顶点数据完全由着色器通过 SRV 自己读取。这是 Mesh Shader 与传统管线
+    // 最直观的结构差异：PSO 里少了一整块描述。
+    // -------------------------------------------------------------------------
+    using SubRS         = PsoStreamSubobject<ID3D12RootSignature*, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE>;
+    using SubAS         = PsoStreamSubobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS>;
+    using SubMS         = PsoStreamSubobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS>;
+    using SubPS         = PsoStreamSubobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS>;
+    using SubRasterizer = PsoStreamSubobject<D3D12_RASTERIZER_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER>;
+    using SubDepth      = PsoStreamSubobject<D3D12_DEPTH_STENCIL_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL>;
+    using SubBlend      = PsoStreamSubobject<D3D12_BLEND_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND>;
+    using SubRTV        = PsoStreamSubobject<D3D12_RT_FORMAT_ARRAY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS>;
+    using SubDSV        = PsoStreamSubobject<DXGI_FORMAT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT>;
+    using SubSampleMask = PsoStreamSubobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK>;
+    using SubSampleDesc = PsoStreamSubobject<DXGI_SAMPLE_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC>;
+    using SubTopology   = PsoStreamSubobject<D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY>;
+    using SubNodeMask   = PsoStreamSubobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK>;
+    using SubFlags      = PsoStreamSubobject<D3D12_PIPELINE_STATE_FLAGS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS>;
+
+    // 所有成员都是 alignas(8) 且尺寸为 8 的倍数，因此结构体内没有填充，
+    // 它的内存布局**就是**子对象流本身。
+    struct MeshShaderPsoStream
+    {
+        SubRS         rootSignature;
+        SubAS         amplificationShader; // M19
+        SubMS         meshShader;
+        SubPS         pixelShader;
+        SubRasterizer rasterizer;
+        SubDepth      depthStencil;
+        SubBlend      blend;
+        SubRTV        rtvFormats;
+        SubDSV        dsvFormat;
+        SubSampleMask sampleMask;
+        SubSampleDesc sampleDesc;
+        SubTopology   topology;
+        SubNodeMask   nodeMask;
+        SubFlags      flags;
+    };
+
+    MeshShaderPsoStream stream = {};
+
+    stream.rootSignature.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+    stream.rootSignature.data = m_meshShaderRootSignature.Get();
+
+    // M19：AS 必须排在 MS 之前，两者共用同一套根绑定
+    stream.amplificationShader.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
+    stream.amplificationShader.data = { asBytecode.data(), asBytecode.size() };
+
+    stream.meshShader.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
+    stream.meshShader.data = { msBytecode.data(), msBytecode.size() };
+
+    stream.pixelShader.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS;
+    stream.pixelShader.data = { psBytecode.data(), psBytecode.size() };
+
+    // 法线锥剔除只适用于单面表面。开关 AS 剔除时均使用相同的背面剔除，
+    // 从而只减少不可见几何的组装，保持最终画面一致。
+    stream.rasterizer.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+    stream.rasterizer.data.FillMode              = D3D12_FILL_MODE_SOLID;
+    stream.rasterizer.data.CullMode              = D3D12_CULL_MODE_BACK;
+    stream.rasterizer.data.FrontCounterClockwise = FALSE;
+    stream.rasterizer.data.DepthBias             = D3D12_DEFAULT_DEPTH_BIAS;
+    stream.rasterizer.data.DepthBiasClamp        = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+    stream.rasterizer.data.SlopeScaledDepthBias  = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    stream.rasterizer.data.DepthClipEnable       = TRUE;
+    stream.rasterizer.data.MultisampleEnable     = FALSE;
+    stream.rasterizer.data.AntialiasedLineEnable = FALSE;
+    stream.rasterizer.data.ForcedSampleCount     = 0;
+    stream.rasterizer.data.ConservativeRaster    = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+    // Mesh Shader 路径是**独立的一遍**，不复用 Depth Prepass 的深度，
+    // 所以这里自己写深度（WriteMask = ALL、Func = LESS）。
+    stream.depthStencil.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
+    stream.depthStencil.data.DepthEnable      = TRUE;
+    stream.depthStencil.data.DepthWriteMask   = D3D12_DEPTH_WRITE_MASK_ALL;
+    stream.depthStencil.data.DepthFunc        = D3D12_COMPARISON_FUNC_LESS;
+    stream.depthStencil.data.StencilEnable    = FALSE;
+    stream.depthStencil.data.StencilReadMask  = D3D12_DEFAULT_STENCIL_READ_MASK;
+    stream.depthStencil.data.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    stream.depthStencil.data.FrontFace        = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                                  D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS };
+    stream.depthStencil.data.BackFace         = stream.depthStencil.data.FrontFace;
+
+    // 默认混合（不混合）。D3D12_DEFAULT 宏在 C++ 里不可用，逐字段给默认值。
+    stream.blend.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND;
+    stream.blend.data.AlphaToCoverageEnable  = FALSE;
+    stream.blend.data.IndependentBlendEnable = FALSE;
+    for (UINT i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+    {
+        D3D12_RENDER_TARGET_BLEND_DESC& rt = stream.blend.data.RenderTarget[i];
+        rt.BlendEnable           = FALSE;
+        rt.LogicOpEnable         = FALSE;
+        rt.SrcBlend              = D3D12_BLEND_ONE;
+        rt.DestBlend             = D3D12_BLEND_ZERO;
+        rt.BlendOp               = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha         = D3D12_BLEND_ONE;
+        rt.DestBlendAlpha        = D3D12_BLEND_ZERO;
+        rt.BlendOpAlpha          = D3D12_BLEND_OP_ADD;
+        rt.LogicOp               = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+
+    // 渲染目标格式必须与主 Pass 一致，否则切模式时 RTV 绑定会不匹配。
+    stream.rtvFormats.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS;
+    stream.rtvFormats.data.NumRenderTargets = 1;
+    stream.rtvFormats.data.RTFormats[0]     = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    stream.dsvFormat.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT;
+    stream.dsvFormat.data = DXGI_FORMAT_D32_FLOAT;
+
+    stream.sampleMask.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK;
+    stream.sampleMask.data = UINT_MAX;
+
+    stream.sampleDesc.type        = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC;
+    stream.sampleDesc.data.Count  = 1;
+    stream.sampleDesc.data.Quality = 0;
+
+    stream.topology.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY;
+    stream.topology.data = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+    stream.nodeMask.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK;
+    stream.nodeMask.data = 0;
+
+    stream.flags.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS;
+    stream.flags.data = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    D3D12_PIPELINE_STATE_STREAM_DESC streamDesc = {};
+    streamDesc.SizeInBytes                   = sizeof(stream);
+    streamDesc.pPipelineStateSubobjectStream = &stream;
+
+    // CreatePipelineState（接收子对象流的那版）在 **ID3D12Device2** 上，
+    // 不在基接口 ID3D12Device 上。设备本身早就实现了它（D3D12CreateDevice 返回的
+    // 对象支持到最新接口），所以这里 QueryInterface 一次即可。
+    ComPtr<ID3D12Device2> device2;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device2))))
+    {
+        std::cerr << "[Renderer] ID3D12Device2 not available; cannot create Mesh Shader PSO.\n";
+        return false;
+    }
+
+    if (FAILED(device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&m_meshShaderPipelineState))))
+    {
+        std::cerr << "[Renderer] Failed to create Mesh Shader PSO.\n";
+        return false;
+    }
+
+    std::cout << "[Renderer] Mesh Shader PSO ready"
+              << " (AS " << asBytecode.size() << " B, MS " << msBytecode.size()
+              << " B, PS " << psBytecode.size()
+              << " B DXIL, no input layout)\n";
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2399,6 +2951,345 @@ void Renderer::CompareGpuAndCpuCulling()
         m_fenceValue, kCommandsToDump);
 }
 
+// ===========================================================================
+// M19：AS 剔除统计缓冲
+// ===========================================================================
+// 布局（前 16 字节必须与 MeshletAS.hlsl 的 InterlockedAdd 偏移一致）：
+//   [ 0.. 3]  视锥剔除数 / 法线锥剔除数 / 可见 meshlet 数 / 可见三角形数
+//   [16..  ]  每 meshlet 的剔除状态（0=可见 1=视锥剔除 2=法线锥剔除）
+//
+// 为什么统计要绕一圈 GPU 再读回来，而不是 CPU 自己算：
+//   **剔除是 GPU 做的**。CPU 并不知道 AS 里用的视锥平面与法线锥判据最终
+//   淘汰了哪些 meshlet —— 把这些数字读回来，是验证「GPU 侧剔除确实生效了」
+//   的唯一手段。统计错了，视觉上可能看不出来（画面依然正确），
+//   但意味着剔除逻辑没按预期工作。
+// ===========================================================================
+bool Renderer::CreateMeshletCullStats(ID3D12Device* device, std::uint32_t meshletCount)
+{
+    if (meshletCount == 0)
+    {
+        return false;
+    }
+
+    m_cullStatsByteSize = 16u + meshletCount * 4u;
+
+    // 对齐到 256 字节：DEFAULT 缓冲的对齐要求，也让两个 CopyBufferRegion 都整齐。
+    const UINT64 bufferSize = (static_cast<UINT64>(m_cullStatsByteSize) + 255ull) & ~255ull;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width            = bufferSize;
+    desc.Height           = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels        = 1;
+    desc.Format           = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    // ---- 主缓冲（DEFAULT + UAV）----
+    {
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC uavDesc = desc;
+        uavDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        // InitialState 必须给 COMMON：Buffer 的 InitialState 会被运行时忽略，
+        // 直接声明成 UNORDERED_ACCESS 会触发 Debug Layer 的 ID=1328 警告
+        //（与 M16 的 LOD 元数据缓冲是同一个坑）。
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &uavDesc,
+                                                   D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                   IID_PPV_ARGS(&m_cullStatsBuffer))))
+        {
+            std::cerr << "[Renderer] Failed to create meshlet cull stats buffer.\n";
+            return false;
+        }
+        m_cullStatsState = D3D12_RESOURCE_STATE_COMMON;
+    }
+
+    // ---- 零缓冲（UPLOAD，每帧拷贝一次把计数器清零）----
+    // 比 ClearUnorderedAccessViewUint 简单：不需要额外的非着色器可见描述符。
+    {
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                   IID_PPV_ARGS(&m_cullStatsZero))))
+        {
+            std::cerr << "[Renderer] Failed to create meshlet cull stats zero buffer.\n";
+            return false;
+        }
+
+        void* mapped = nullptr;
+        const D3D12_RANGE noRead = { 0, 0 };
+        if (SUCCEEDED(m_cullStatsZero->Map(0, &noRead, &mapped)))
+        {
+            std::memset(mapped, 0, static_cast<size_t>(bufferSize));
+            m_cullStatsZero->Unmap(0, nullptr);
+        }
+    }
+
+    // ---- READBACK × kFrameCount（延迟读回，避免等待 GPU）----
+    {
+        D3D12_HEAP_PROPERTIES heap = {};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+
+        for (UINT i = 0; i < kFrameCount; ++i)
+        {
+            if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                       IID_PPV_ARGS(&m_cullStatsReadback[i]))))
+            {
+                std::cerr << "[Renderer] Failed to create meshlet cull stats readback.\n";
+                return false;
+            }
+            m_cullStatsReadbackFrame[i] = 0u;
+        }
+    }
+
+    m_meshletCullStats.meshletStatus.assign(meshletCount, 0u);
+    m_meshletCullStats.totalMeshlets  = meshletCount;
+    m_meshletCullStats.totalTriangles = m_meshletBuilder.GetStats().primitiveIndexCount;
+    m_cullStatsFrameCounter           = 0u;
+
+    std::cout << "[Renderer] Meshlet cull stats ready: " << m_cullStatsByteSize
+              << " B (" << meshletCount << " meshlets)\n";
+    return true;
+}
+
+// 延迟读回：读的是 kFrameCount 帧之前记录的那一格，那时 GPU 早已写完。
+void Renderer::ReadbackMeshletCullStats()
+{
+    if (m_cullStatsReadback[0] == nullptr || m_cullStatsByteSize == 0u)
+    {
+        return;
+    }
+
+    const std::uint32_t slot = m_cullStatsFrameCounter % kFrameCount;
+    if (m_cullStatsReadbackFrame[slot] != 1u)
+    {
+        return; // 这一格还没被写入过（启动初期）
+    }
+
+    void* mapped = nullptr;
+    const D3D12_RANGE readRange = { 0, m_cullStatsByteSize };
+    if (FAILED(m_cullStatsReadback[slot]->Map(0, &readRange, &mapped)) || mapped == nullptr)
+    {
+        return;
+    }
+
+    const std::uint32_t* words = static_cast<const std::uint32_t*>(mapped);
+    m_meshletCullStats.frustumCulled    = words[0];
+    m_meshletCullStats.coneCulled       = words[1];
+    m_meshletCullStats.visible          = words[2];
+    m_meshletCullStats.visibleTriangles = words[3];
+
+    const size_t statusCount =
+        (std::min)(m_meshletCullStats.meshletStatus.size(),
+                   static_cast<size_t>((m_cullStatsByteSize - 16u) / 4u));
+    for (size_t i = 0; i < statusCount; ++i)
+    {
+        m_meshletCullStats.meshletStatus[i] = words[4 + i];
+    }
+    m_meshletCullStats.valid = true;
+
+    const D3D12_RANGE noWrite = { 0, 0 };
+    m_cullStatsReadback[slot]->Unmap(0, &noWrite);
+}
+
+// ===========================================================================
+// M18：Mesh Shader 绘制记录
+// ===========================================================================
+// 这是 M18 的落点：**几何完全由 GPU 的 Mesh Shader 组装**。
+//
+// 与传统路径最直观的差别（对照本节与 CPU-Driven 的循环）：
+//   CPU-Driven    : for (每个实例) { SetCBV; DrawIndexedInstanced(1536, 1, ...); }
+//                   -> CPU 循环 N 次，IA 每次读 1536 个索引
+//   Mesh Shader   : DispatchMesh(meshletCount, 1, 1);
+//                   -> CPU 只发一次，**没有任何索引缓冲被 IA 读取**
+//
+// 注意这里**没有** IASetVertexBuffers / IASetIndexBuffer ——
+// Mesh Shader 路径下这两个调用是**非法**的（PSO 里没有 Input Layout，
+// 顶点由着色器通过 SRV 自己读）。
+// ===========================================================================
+void Renderer::RecordMeshShaderDraw(const DirectX::XMMATRIX& viewProj)
+{
+    if (!m_meshShaderSupported || m_meshShaderPipelineState == nullptr ||
+        m_meshShaderRootSignature == nullptr)
+    {
+        return;
+    }
+    if (!m_meshletBuilder.IsBuilt() || m_meshletSphereMesh.GetVertexBufferResource() == nullptr)
+    {
+        return;
+    }
+
+    const std::uint32_t meshletCount = m_meshletBuilder.GetStats().meshletCount;
+    if (meshletCount == 0)
+    {
+        return;
+    }
+
+    // ---- 0. M19：读取上一轮 AS 写出的剔除统计 ----
+    //
+    // 延迟 kFrameCount 帧读回，所以这里读的是「若干帧前」的统计。
+    // 对于统计显示这完全可以接受，而且**不会让 CPU 等待 GPU**。
+    ReadbackMeshletCullStats();
+
+    // ---- 0b. 清零统计缓冲 ----
+    //
+    // AS 用 InterlockedAdd 累加，所以每帧必须先归零。
+    // 用「UPLOAD 零缓冲 + CopyBufferRegion」而不是 ClearUnorderedAccessViewUint：
+    // 后者需要额外的**非着色器可见** UAV 描述符，而这里已经有了现成的零缓冲。
+    if (m_cullStatsBuffer != nullptr)
+    {
+        if (m_cullStatsState != D3D12_RESOURCE_STATE_COPY_DEST)
+        {
+            const D3D12_RESOURCE_BARRIER toCopy = MakeTransitionBarrier(
+                m_cullStatsBuffer.Get(), m_cullStatsState, D3D12_RESOURCE_STATE_COPY_DEST);
+            m_commandList->ResourceBarrier(1, &toCopy);
+            m_cullStatsState = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+        m_commandList->CopyBufferRegion(m_cullStatsBuffer.Get(), 0, m_cullStatsZero.Get(), 0,
+                                        m_cullStatsByteSize);
+
+        // AS 要当 UAV 写它
+        const D3D12_RESOURCE_BARRIER toUav = MakeTransitionBarrier(
+            m_cullStatsBuffer.Get(), m_cullStatsState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_commandList->ResourceBarrier(1, &toUav);
+        m_cullStatsState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+
+    // ---- 1. 清深度 ----
+    //
+    // Mesh Shader 路径不跑 M13 的 Depth Prepass（它是独立的一遍），
+    // 所以深度由这里自己清。不清的话会残留上一帧的深度，
+    // 表现为球体被裁掉一部分 —— 一个很容易被误判成「几何错误」的假象。
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHeap->GetCPUDescriptorHandleForHeapStart();
+    m_commandList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+
+    // ---- 2. 绑定 Mesh Shader 的根签名与 PSO ----
+    m_commandList->SetGraphicsRootSignature(m_meshShaderRootSignature.Get());
+    m_commandList->SetPipelineState(m_meshShaderPipelineState.Get());
+
+    // ---- 3. 计算世界变换 ----
+    //
+    // 把球体缩放到一个在场景尺度下清晰可见的大小。
+    // 网格自身的半径从 meshlet 包围球推出来 —— 不再单独存一份状态。
+    float meshRadius = 0.0f;
+    for (const MeshletBoundsGPU& b : m_meshletBuilder.GetBounds())
+    {
+        const float reach = std::sqrt(b.boundingSphere.x * b.boundingSphere.x +
+                                      b.boundingSphere.y * b.boundingSphere.y +
+                                      b.boundingSphere.z * b.boundingSphere.z) + b.boundingSphere.w;
+        meshRadius = (std::max)(meshRadius, reach);
+    }
+
+    constexpr float kTargetWorldRadius = 9.0f; // 相对相机距离 48 而言足够醒目
+    const float scale = (meshRadius > 1e-6f) ? (kTargetWorldRadius / meshRadius) : 1.0f;
+
+    const XMMATRIX world = XMMatrixScaling(scale, scale, scale);
+
+    // ---- 4. root constants b0（M19 起 52 个 DWORD）----
+    //
+    // 布局必须与 MeshletAS.hlsl / MeshletMS.hlsl / MeshletPS.hlsl 的
+    // MeshShaderConstants **逐字段一致** —— 三者共用同一块 root constants。
+    //
+    // 行主序上传 + cbuffer 默认 column-major -> 着色器里用 mul(M, v)（与全项目一致）。
+    struct MeshShaderConstants
+    {
+        XMFLOAT4X4    worldViewProj;         // 16
+        XMFLOAT4      color;                 //  4
+        XMFLOAT4      frustumPlanes[6];      // 24  AS 视锥剔除
+        XMFLOAT4      eyePosition;           //  4  AS 法线锥剔除
+        std::uint32_t meshletCount;          //  1
+        std::uint32_t coneCullingEnabled;    //  1
+        std::uint32_t frustumCullingEnabled; //  1
+        std::uint32_t pad0;                  //  1
+    };
+
+    MeshShaderConstants constants = {};
+    XMStoreFloat4x4(&constants.worldViewProj, world * viewProj);
+    constants.color        = { 0.35f, 0.75f, 0.95f, 1.0f }; // 冷色，与场景里的暖色立方体区分
+    constants.meshletCount = meshletCount;
+
+    // 包围球、锥轴和 apexOffset 都在模型空间；平面和相机也必须在同一空间。
+    // 从 world*viewProj 提取并归一化平面，可直接测试未变换的包围球。
+    ExtractFrustumPlanes(world * viewProj, constants.frustumPlanes);
+
+    // 相机世界位置 = 视图矩阵逆矩阵的平移分量。
+    // 视图矩阵是行向量约定（v' = v*M），所以平移在**第 3 行**。
+    const XMMATRIX inverseView = XMMatrixInverse(nullptr, m_camera.GetView());
+    const XMMATRIX inverseWorld = XMMatrixInverse(nullptr, world);
+    XMStoreFloat4(&constants.eyePosition,
+                  XMVector3TransformCoord(inverseView.r[3], inverseWorld));
+
+    constants.coneCullingEnabled    = m_meshletConeCullingEnabled ? 1u : 0u;
+    constants.frustumCullingEnabled = m_meshletFrustumCullingEnabled ? 1u : 0u;
+
+    static_assert(sizeof(MeshShaderConstants) == 52 * sizeof(std::uint32_t),
+                  "root constants 布局必须与 HLSL 的 MeshShaderConstants 一致（52 DWORD）");
+
+    m_commandList->SetGraphicsRoot32BitConstants(0, 52, &constants, 0);
+
+    // ---- 5. 绑定 t0..t4（一张表，槽位 44..48 连续）----
+    D3D12_GPU_DESCRIPTOR_HANDLE srvTable = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    srvTable.ptr += static_cast<UINT64>(kMeshletSrvSlot) * m_srvDescriptorSize;
+    m_commandList->SetGraphicsRootDescriptorTable(1, srvTable);
+
+    // ---- 5b. 绑定 u0（root UAV）—— AS 写剔除统计 ----
+    if (m_cullStatsBuffer != nullptr)
+    {
+        m_commandList->SetGraphicsRootUnorderedAccessView(
+            2, m_cullStatsBuffer->GetGPUVirtualAddress());
+    }
+
+    // ---- 6. DispatchMesh ----
+    //
+    // **M19 的关键变化**：dispatch 的规模从「meshlet 数」变成了
+    // 「AS 线程组数 = ceil(meshletCount / AS_GROUP_SIZE)」。
+    //
+    //   一个 AS 组负责 AS_GROUP_SIZE（32）个 meshlet；
+    //   它剔除完之后，**只为自己那部分可见的 meshlet** 发射 MS 线程组。
+    //
+    //   于是从 CPU 看，dispatch 覆盖的是「全部 meshlet 的候选集」，
+    //   而从 GPU 看，MS 线程组的数量恰好等于**可见** meshlet 数 ——
+    //   被剔除的 meshlet 根本没有 MS 线程组存在过。
+    //
+    // DispatchMesh 声明在 **ID3D12GraphicsCommandList6** 上，不在基接口上。
+    // 它在 CreateCommandList 里已经 QueryInterface 出来并缓存（见 m_commandList6）。
+    const std::uint32_t asGroupCount = (meshletCount + kAsGroupSize - 1u) / kAsGroupSize;
+    m_commandList6->DispatchMesh(asGroupCount, 1, 1);
+
+    // ---- 7. 把统计拷进 readback（kFrameCount 帧后才读）----
+    if (m_cullStatsBuffer != nullptr)
+    {
+        const D3D12_RESOURCE_BARRIER toSrc = MakeTransitionBarrier(
+            m_cullStatsBuffer.Get(), m_cullStatsState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        m_commandList->ResourceBarrier(1, &toSrc);
+        m_cullStatsState = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+        const std::uint32_t slot = m_cullStatsFrameCounter % kFrameCount;
+        m_commandList->CopyBufferRegion(m_cullStatsReadback[slot].Get(), 0,
+                                        m_cullStatsBuffer.Get(), 0, m_cullStatsByteSize);
+        m_cullStatsReadbackFrame[slot] = 1u;
+        ++m_cullStatsFrameCounter;
+    }
+
+    m_stats.gpuDriven           = true;
+    m_stats.meshShaderPath      = true;
+    m_stats.submittedDrawCalls  = 0;
+    m_stats.indirectExecuteCount = 0;
+    m_stats.meshShaderDispatchCount = 1;
+    m_stats.meshletsDispatched  = meshletCount;
+    m_stats.asGroupCount        = asGroupCount;
+
+    // 12. 调试线框仍然照常叠加（J 键的 meshlet 包围球在这里最有价值：
+    //     它来自 CPU 侧的 ComputeCullData，而球体来自 GPU 的 Mesh Shader ——
+    //     两者是**独立的数据路径**，互相印证几何是否正确）。
+}
+
 void Renderer::RecordGpuDrivenDraw(std::uint32_t visibleCount, UINT segmentSrvBaseSlot,
                                    std::uint32_t lodCount)
 {
@@ -3063,6 +3954,60 @@ void Renderer::HandleKey(UINT virtualKey)
         std::cout << "[Renderer] HZB build: " << (m_hzbEnabled ? "ON" : "OFF") << "\n";
         break;
 
+    // ---- M17：Meshlet 可视化开关 ----
+    //
+    // 每个 meshlet 一个包围球，色相按索引均匀分布 —— 一眼看出划分是否合理
+    // （理想的聚类应该形成若干紧凑的、互不交叠的色块，而不是零散碎屑）。
+    case 'J':
+        m_meshletVisualizationEnabled = !m_meshletVisualizationEnabled;
+
+        // **这一步是必须的，否则按 J 什么都不会发生。**
+        //
+        // 调试线框（包括 meshlet 包围球）只在 m_debugViewMode > 0 时才会被
+        // BuildDebugVisualization 构建出来。J 键本身只切换
+        // m_meshletVisualizationEnabled，如果不把 debugViewMode 也抬到
+        // 「视锥 + 包围球」那一档，BuildDebugVisualization 根本不会被调用，
+        // m_debugLines 始终为空 —— 表现为「按了 J 但画面上没有任何变化」。
+        //
+        // 这与 M15 的 occlusionViz 是同一个模式（开启遮挡剔除可视化时
+        // 自动把 debug viz 提到第 2 级），因为两者都依赖包围球这一层。
+        if (m_meshletVisualizationEnabled && m_debugViewMode < 2)
+        {
+            m_debugViewMode = 2;
+        }
+
+        std::cout << "[Renderer] Meshlet visualization: "
+                  << (m_meshletVisualizationEnabled ? "ON" : "OFF");
+        if (m_meshletBuilder.IsBuilt())
+        {
+            std::cout << "  (" << m_meshletBuilder.GetStats().meshletCount << " meshlets)";
+        }
+        else
+        {
+            std::cout << "  (no meshlet data)";
+        }
+        std::cout << "\n";
+        break;
+
+    // ---- M19：meshlet 级剔除的两级开关 ----
+    //
+    // 注意按键选择：N 已经被 HZB 可视化占用了，所以法线锥用 Y。
+    // 这两个开关的意义是**可以 A/B**：
+    //   关掉法线锥 -> 统计里 coneCulled 变 0、visible 上升、可见三角形数上升，
+    //   而画面（几乎）不变 —— 因为没有可见性变化，只是多做了无用功。
+    //   这正好证明「法线锥剔除剔掉的确实是看不见的几何」。
+    case 'F':
+        m_meshletFrustumCullingEnabled = !m_meshletFrustumCullingEnabled;
+        std::cout << "[Renderer] Meshlet frustum culling: "
+                  << (m_meshletFrustumCullingEnabled ? "ON" : "OFF") << "\n";
+        break;
+
+    case 'Y':
+        m_meshletConeCullingEnabled = !m_meshletConeCullingEnabled;
+        std::cout << "[Renderer] Meshlet normal-cone culling: "
+                  << (m_meshletConeCullingEnabled ? "ON" : "OFF") << "\n";
+        break;
+
     // ---- M16：GPU-Driven LOD 开关 ----
     case 'L':
         m_lodEnabled = !m_lodEnabled;
@@ -3146,15 +4091,41 @@ void Renderer::HandleKey(UINT virtualKey)
     // ---- M12：切换渲染路径 ----
     // CPU-Driven：CPU 对每个可见实例发一次 SetCBV + DrawIndexedInstanced
     // GPU-Driven：CPU 只发一次 ExecuteIndirect，命令条数由 GPU 计数决定
+    // MeshShader ：CPU 只发一次 DispatchMesh，几何由 Mesh Shader 自己组装
+    //
+    // 三档切换，但**只在硬件支持时**才把 MeshShader 纳入循环 ——
+    // 这就是 Feature Fallback：不支持的设备上 M 键只在两档之间切换，
+    // 永远不会走到一个「没有 PSO」的模式。
     case 'M':
-        m_renderMode = (m_renderMode == RenderMode::CpuDriven)
-                           ? RenderMode::GpuDriven
-                           : RenderMode::CpuDriven;
-        std::cout << "[Renderer] Render mode: "
-                  << (m_renderMode == RenderMode::GpuDriven
-                          ? "GPU-DRIVEN (ExecuteIndirect)"
-                          : "CPU-DRIVEN (per-instance draw)")
-                  << "\n";
+        if (m_renderMode == RenderMode::CpuDriven)
+        {
+            m_renderMode = RenderMode::GpuDriven;
+        }
+        else if (m_renderMode == RenderMode::GpuDriven)
+        {
+            m_renderMode = m_meshShaderSupported ? RenderMode::MeshShader
+                                                 : RenderMode::CpuDriven;
+        }
+        else
+        {
+            m_renderMode = RenderMode::CpuDriven;
+        }
+
+        std::cout << "[Renderer] Render mode: ";
+        switch (m_renderMode)
+        {
+        case RenderMode::GpuDriven:
+            std::cout << "GPU-DRIVEN (ExecuteIndirect)";
+            break;
+        case RenderMode::MeshShader:
+            std::cout << "MESH SHADER (DispatchMesh, "
+                      << m_meshletBuilder.GetStats().meshletCount << " meshlets)";
+            break;
+        default:
+            std::cout << "CPU-DRIVEN (per-instance draw)";
+            break;
+        }
+        std::cout << "\n";
         break;
 
     default:
@@ -3200,12 +4171,21 @@ void Renderer::BuildStatisticsText()
         y += 18.0f;
 
         // M12：渲染路径与 GPU 侧的 draw 提交方式 —— 本里程碑最核心的一组对比数字。
-        //   CPU-Driven：CPU 逐个实例提交，draws = 可见实例数
-        //   GPU-Driven：CPU 一次 draw 都没提交，只有 1 次 ExecuteIndirect；
-        //               真正的实例数由 GPU 写进间接命令里
-        if (m_stats.gpuDriven)
+        //   CPU-Driven ：CPU 逐个实例提交，draws = 可见实例数
+        //   GPU-Driven ：CPU 一次 draw 都没提交，只有 1 次 ExecuteIndirect；
+        //                真正的实例数由 GPU 写进间接命令里
+        //   MeshShader ：CPU 一次 draw 都没提交，只有 1 次 DispatchMesh；
+        //                几何由 Mesh Shader 自己组装（M18）
+        //
+        // 注意这里必须查 m_stats 而不是 m_renderMode —— 前者是本帧**实际**走的路径，
+        // 后者只是「请求」。两者在能力不足回退时可能不一致。
+        if (m_stats.meshShaderPath)
         {
-            std::snprintf(line, sizeof(line), "Mode      : GPU-DRIVEN (1 indirect cmd)");
+            std::snprintf(line, sizeof(line), "Mode      : MESH SHADER (DispatchMesh)");
+        }
+        else if (m_stats.gpuDriven)
+        {
+            std::snprintf(line, sizeof(line), "Mode      : GPU-DRIVEN (ExecuteIndirect)");
         }
         else
         {
@@ -3215,10 +4195,65 @@ void Renderer::BuildStatisticsText()
         m_debugText.AddText(x, y, 1.0f, line);
         y += 18.0f;
 
-        std::snprintf(line, sizeof(line), "CPU draws : %u   ExecIndirect: %u",
-                      m_stats.submittedDrawCalls, m_stats.indirectExecuteCount);
+        // M18：MeshShader 模式下 ExecIndirect 恒为 0，真正有意义的数字是 DispatchMesh 次数
+        // 与它覆盖的 meshlet 数 —— 所以按路径分别显示，而不是永远打同一组计数器。
+        if (m_stats.meshShaderPath)
+        {
+            std::snprintf(line, sizeof(line), "CPU draws : %u   DispatchMesh: %u x %u meshlets",
+                          m_stats.submittedDrawCalls, m_stats.meshShaderDispatchCount,
+                          m_stats.meshletsDispatched);
+        }
+        else
+        {
+            std::snprintf(line, sizeof(line), "CPU draws : %u   ExecIndirect: %u",
+                          m_stats.submittedDrawCalls, m_stats.indirectExecuteCount);
+        }
         m_debugText.AddText(x, y, 1.0f, line);
         y += 18.0f;
+
+        // ---- M19：Amplification Shader 的 meshlet 级剔除统计 ----
+        //
+        // 这一组数字是 M19 的验收核心：它们证明「剔除确实在 GPU 上发生了」，
+        // 而不只是代码看起来对。全部来自 AS 写入的 UAV，CPU 延迟若干帧读回。
+        if (m_stats.meshShaderPath && m_meshletCullStats.valid)
+        {
+            const MeshletCullStats& cs = m_meshletCullStats;
+
+            m_debugText.AddText(x, y, 1.0f, "--- MESHLET CULLING (AS) ---");
+            y += 18.0f;
+
+            std::snprintf(line, sizeof(line), "Meshlets  : %u total  [F]rustum:%s  [Y]cone:%s",
+                          cs.totalMeshlets,
+                          m_meshletFrustumCullingEnabled ? "ON" : "OFF",
+                          m_meshletConeCullingEnabled ? "ON" : "OFF");
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+
+            std::snprintf(line, sizeof(line), "  frustum : %u culled", cs.frustumCulled);
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+
+            std::snprintf(line, sizeof(line), "  cone    : %u culled", cs.coneCulled);
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+
+            std::snprintf(line, sizeof(line), "  visible : %u  (AS groups: %u)",
+                          cs.visible, m_stats.asGroupCount);
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+
+            // 「实际组装的三角形」与「全场三角形」的比值就是剔除收益。
+            const double triPercent =
+                100.0 * static_cast<double>(cs.visibleTriangles) /
+                static_cast<double>(cs.totalTriangles > 0 ? cs.totalTriangles : 1);
+            std::snprintf(line, sizeof(line), "  tris    : %u / %u  (%.1f%% assembled)",
+                          cs.visibleTriangles, cs.totalTriangles, triPercent);
+            m_debugText.AddText(x, y, 1.0f, line);
+            y += 18.0f;
+
+            m_debugText.AddText(x, y, 1.0f, "  [J] colour meshlets by cull status");
+            y += 18.0f;
+        }
 
         // M13：Depth Prepass 状态与 GPU 侧耗时（Timestamp Query 测得）
         std::snprintf(line, sizeof(line), "Prepass   : %s   [P] toggle",
@@ -3405,13 +4440,13 @@ void Renderer::BuildStatisticsText()
         m_debugText.AddText(x, y, 1.0f, line);
         y += 26.0f;
 
-        m_debugText.AddText(x, y, 1.0f, "[L] LOD  [,][.] LOD bias  [O] occlusion  [K] culled viz  [M] mode");
+        m_debugText.AddText(x, y, 1.0f, "[L] LOD  [,][.] bias  [J] meshlets  [O] occlusion  [K] culled  [M] mode");
         y += 18.0f;
 
         m_debugText.AddText(x, y, 1.0f, "[G] compare  [T] validate  [P] prepass  [B] depth viz  [H] HZB  [N] viz");
         y += 18.0f;
 
-        m_debugText.AddText(x, y, 1.0f, "[1][2][3] count  [C] culling  [V] viz  [Space] orbit  [R] reset");
+        m_debugText.AddText(x, y, 1.0f, "[1][2][3] count  [C] culling  [V] viz  [Space] orbit  [R] reset  [F]/[Y] meshlet cull");
     };
 
     // 背景条：实例场景里模型很密集，纯文字会淹没在几何细节中，
@@ -3633,6 +4668,124 @@ void Renderer::BuildDebugVisualization(FXMMATRIX viewProj,
                 continue;
             }
             m_debugLines.AddSphere(instances[i].boundingSphere, kLODColors[lod], 12);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // M17：每个 Meshlet 用一种颜色显示（任务要求的可视化）
+    //
+    //   画的是**每个 meshlet 的包围球**，颜色由 meshlet 索引经 HSV 色环映射而来 ——
+    //   相邻索引色彩相邻，所以肉眼能直接看出「哪些三角形被聚成了一簇」。
+    //
+    //   数据来自 DirectXMesh 的 ComputeCullData（就是 M18 要用来做剔除的同一份
+    //   boundingSphere），所以这个可视化展示的不是另算的近似，而是真实数据。
+    //
+    //   为什么需要缩放/平移：
+    //     meshlet 的包围球在 sphere.obj 的**局部空间**里（半径约 1 的量级），
+    //     而场景实例分布在半径 ~55 的范围。直接用局部坐标画会小到看不见。
+    //     所以先把整个 meshlet 云归一化到以原点为中心、外接半径 kDisplayRadius，
+    //     位置与朝向仍保持真实比例 —— 这样既看得见，又忠实反映划分结构。
+    // -------------------------------------------------------------------------
+    if (m_meshletVisualizationEnabled && m_meshletBuilder.IsBuilt())
+    {
+        const std::vector<MeshletBoundsGPU>& bounds = m_meshletBuilder.GetBounds();
+
+        // 1. 求整个 meshlet 云的外接范围（用球心包围盒的 8 个角）
+        XMFLOAT3 cloudMin = {  FLT_MAX,  FLT_MAX,  FLT_MAX };
+        XMFLOAT3 cloudMax = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+
+        for (const MeshletBoundsGPU& b : bounds)
+        {
+            const float r = b.boundingSphere.w;
+            cloudMin.x = (std::min)(cloudMin.x, b.boundingSphere.x - r);
+            cloudMin.y = (std::min)(cloudMin.y, b.boundingSphere.y - r);
+            cloudMin.z = (std::min)(cloudMin.z, b.boundingSphere.z - r);
+            cloudMax.x = (std::max)(cloudMax.x, b.boundingSphere.x + r);
+            cloudMax.y = (std::max)(cloudMax.y, b.boundingSphere.y + r);
+            cloudMax.z = (std::max)(cloudMax.z, b.boundingSphere.z + r);
+        }
+
+        const XMFLOAT3 cloudCenter = { (cloudMin.x + cloudMax.x) * 0.5f,
+                                       (cloudMin.y + cloudMax.y) * 0.5f,
+                                       (cloudMin.z + cloudMax.z) * 0.5f };
+
+        const float extent = (std::max)({ cloudMax.x - cloudMin.x,
+                                          cloudMax.y - cloudMin.y,
+                                          cloudMax.z - cloudMin.z });
+
+        constexpr float kDisplayRadius = 22.0f; // 归一化后整个云的外接半径（世界单位）
+        const float scale = (extent > 1e-6f) ? (kDisplayRadius / (extent * 0.5f)) : 1.0f;
+
+        // 2. 逐个 meshlet 画一个球，色相按索引均匀分布
+        const std::size_t meshletCount = bounds.size();
+
+        for (std::size_t i = 0; i < meshletCount; ++i)
+        {
+            const MeshletBoundsGPU& b = bounds[i];
+
+            // 回退方案用：色相按 meshlet 索引均匀分布。
+            // （只有 AS 统计不可用时才走这条路，见下方 coloredByStatus；
+            //   具体的 HSV 转换在 `if (!coloredByStatus)` 块内完成，
+            //   所以这里只算色相，不在这里展开 h6/sector/... 这些中间量。）
+            const float hue = static_cast<float>(i) / static_cast<float>(meshletCount);
+
+            XMFLOAT4 color = { 1.0f, 0.0f, 0.0f, 1.0f };
+
+            // -----------------------------------------------------------------
+            // M19：如果 AS 的剔除统计可用，就**按剔除状态着色**，而不是按索引色相。
+            //
+            //   绿 = 可见（AS 通过 -> 会为它启动一个 MS 线程组）
+            //   红 = 被视锥剔除（不在视野内）
+            //   橙 = 被法线锥剔除（整簇背对相机）
+            //
+            // 这是本阶段最直接的验收手段：只看统计数字无法判断「剔除的位置对不对」——
+            // 比如把球正面的一簇误判成背面，数字看起来仍然合理（coneCulled=1）。
+            // 用颜色标出来，就能一眼看出剔除是否落在**物理上正确**的地方
+            // （橙色的簇应当在球体背面）。
+            // -----------------------------------------------------------------
+            bool coloredByStatus = false;
+            if (m_stats.meshShaderPath && m_meshletCullStats.valid &&
+                i < m_meshletCullStats.meshletStatus.size())
+            {
+                switch (m_meshletCullStats.meshletStatus[i])
+                {
+                case 1u: color = { 1.00f, 0.15f, 0.15f, 1.0f }; break; // 视锥剔除
+                case 2u: color = { 1.00f, 0.60f, 0.00f, 1.0f }; break; // 法线锥剔除
+                default: color = { 0.20f, 1.00f, 0.30f, 1.0f }; break; // 可见
+                }
+                coloredByStatus = true;
+            }
+
+            if (!coloredByStatus)
+            {
+                // HSV -> RGB：S=1, V=1，色相 i/N。
+                // 相邻 meshlet 因此得到明显不同但连续的颜色，容易分辨边界。
+                const float h6     = hue * 6.0f;
+                const int   sector = static_cast<int>(h6) % 6;
+                const float frac   = h6 - std::floor(h6);
+                const float q      = 1.0f - frac;
+                const float t      = frac;
+
+                switch (sector)
+                {
+                case 0: color = { 1.0f, t,    0.0f, 1.0f }; break;
+                case 1: color = { q,    1.0f, 0.0f, 1.0f }; break;
+                case 2: color = { 0.0f, 1.0f, t,    1.0f }; break;
+                case 3: color = { 0.0f, q,    1.0f, 1.0f }; break;
+                case 4: color = { t,    0.0f, 1.0f, 1.0f }; break;
+                default: color = { 1.0f, 0.0f, q,   1.0f }; break;
+                }
+            }
+
+            // 局部空间 -> 显示空间：先减去云中心，再缩放。不旋转 —— 保留原始比例。
+            const XMFLOAT4 sphereWorld = {
+                (b.boundingSphere.x - cloudCenter.x) * scale,
+                (b.boundingSphere.y - cloudCenter.y) * scale,
+                (b.boundingSphere.z - cloudCenter.z) * scale,
+                b.boundingSphere.w * scale
+            };
+
+            m_debugLines.AddSphere(sphereWorld, color, 10);
         }
     }
 

@@ -21,7 +21,8 @@ public:
                     bool depthPrepass = true,
                     bool depthVisualize = false,
                     bool hzbVisualize = false, std::uint32_t hzbMip = 0,
-                    bool occlusion = true, bool occlusionViz = false);
+                    bool occlusion = true, bool occlusionViz = false,
+                    bool meshShader = false);
     void Run();
     void Shutdown();
 

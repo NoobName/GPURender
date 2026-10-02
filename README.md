@@ -48,7 +48,36 @@
   - **命令缓冲与实例数彻底解耦**：从 M12 的 maxInstances × 20 B（2 MB）变成 lodCount × 20 B（**80 B**）
   - 可视化：`L` 键 / `--debug-viz 2`，包围球按 GPU 实际选中的 LOD 着色（**红=LOD0 / 黄=LOD1 / 绿=LOD2 / 蓝=LOD3**）
   - 已知 Limitation 8 条（与 M15 遮挡剔除互斥、无网格简化、无 hysteresis 与 morphing 等）见学习笔记 M16 第 3 节
-- 尚未实现 two-phase occlusion culling、per-LOD 遮挡剔除与 Meshlet。
+- **Milestone M17** ✅：**Meshlet Preprocessing** —— 用 **Microsoft DirectXMesh** 在**加载期**把导入的网格切成 meshlet（~128 顶点 / ~128 三角形一簇），产出 Meshlet 描述 / UniqueVertexIndices / PrimitiveIndices / Culling Metadata（包围球 + 法线锥）四份数据并上传 GPU。
+  - **不自己实现聚类算法** —— 全部交给 DirectXMesh 的 `ComputeMeshlets` + `ComputeCullData`；本项目只做数据布局与上传
+  - **只编译 18 个源文件中的 2 个**（`DirectXMeshletGenerator` + `DirectXMeshAdjacency`），且把 DirectXMesh 限制在**一个翻译单元内**（公开头不 include `<DirectXMesh.h>`，避免 `<d3d11_4.h>` 污染整个项目）
+  - **实测**（`assets/sphere.obj`，825 顶点 / 1536 三角形）：**13 个 meshlet**，平均 118 tri/meshlet 贴近上限；**primitive indices = 1536 = 源三角形数 -> 零丢失**；顶点重复率 **x1.41**；边界顶点 307（37%）
+  - **GPU 布局**：4 个独立 StructuredBuffer（16 B 描述 / 4 B 局部顶点索引 / **4 B 10+10+10 位打包三角形** / 32 B 剔除数据），合计 **11.16 KB**；索引带宽相比 3xuint32 **降到 1/3**
+  - **可视化**：`J` 键按 meshlet 索引经 HSV 色环着色其包围球 —— 紧凑的色块说明聚类良好，零散碎屑说明划分差
+  - **零回归**：M17 不改动任何渲染路径，meshlet 数据只是被准备好（消费者在 M18 的 Mesh Shader）
+  - 已知 Limitation 6 条见学习笔记 M17 第 4 节
+- **Milestone M18** ✅：**DirectX 12 Mesh Shader Rendering Path** —— **先实测查询**能力（不假设支持），再实现一条**独立**的 Mesh Shader 路径，并保留 `ExecuteIndirect` 与 CPU Indexed 作为 fallback。
+  - **能力实测**：`D3D12_FEATURE_D3D12_OPTIONS7` -> **Mesh Shader Tier 1**（RTX 5070 Laptop，FL 12_1，SM 6.8）—— 这个查询 M1 就搭好了，这次是第一次真正读它的值
+  - **线程组映射**：**1 个线程组 <-> 1 个 meshlet**（`numthreads(128,1,1)`），`SV_GroupID` 直接就是 meshlet 索引
+  - **`SetMeshOutputCounts`** 把「输出多少顶点/三角形」从命令期常数变成**运行时变量** —— 这就是「先剔除再组装」相对「先组装再剔除」的本质区别
+  - **Mesh Shader PSO 必须用 pipeline state stream**（旧 desc 没有 MS 字段）。项目不引入 `d3dx12.h`，手写 20 行等价 subobject 模板；踩到 `C4324` 并在**全量构建**下发现（增量构建漏报）
+  - **GPU meshlet 数据访问**：一张描述符表绑定 t0..t4（meshlet / 局部顶点索引 / 打包三角形 / 剔除数据 / **顶点数据**）—— 最后一个正是 Mesh Shader 的标志：顶点不经过 IA
+  - **三模式切换**（`M` 键）：CPU Indexed / ExecuteIndirect / Mesh Shader；`--mesh-shader` 可直接启动
+  - **Feature Fallback 三层保障**：不支持时不创建 PSO/根签名、`M` 键跳过该档、启动参数静默退回
+  - **实测**：`1 次 DispatchMesh(13,1,1)` 覆盖 1536 个三角形；PSO 里 **no input layout**；Debug Layer clean
+  - **诚实说明**：本阶段**不做 Amplification Shader**，所以**所有 meshlet 都会被组装** —— Mesh Shader 的剔除优势**尚未兑现**，因此也**没有性能对比**
+  - 已知 Limitation 6 条见学习笔记 M18 第 6 节
+- **Milestone M19** ✅：**Amplification Shader + Meshlet-Level GPU Culling** —— 让不可见的 meshlet **根本不启动 Mesh Shader 线程组**。
+  - **AS 两级剔除**：视锥剔除（包围球 vs 6 平面）+ **法线锥剔除**（整簇背对相机，dot(V,A) > sin(α)）
+  - **Compact Payload**：可见 meshlet 索引压成稠密数组（32×4 = 128 B TGSM），MS 用 SV_GroupID 查表取真正的 meshlet 索引
+  - **按需发射**：`DispatchMesh(visibleCount, 1, 1, payload)` —— MS 线程组数恰好等于可见数。被剔除的 meshlet 的顶点着色**从未执行**
+  - **实测**（sphere.obj，13 meshlet）：`coneCulled=1, visible=12, visibleTris=1408/1536`，`1408+128=1536` 自洽
+  - **统计面板**：Total / Frustum culled / Cone culled / Visible / AS groups / 可见三角形占全场比例
+  - **调试可视化**：`J` 键让 meshlet 包围球**按剔除状态着色**（绿=可见 / 红=视锥剔除 / 橙=法线锥剔除）；`F`/`Y` 分别开关两级剔除做 A/B
+  - **踩到的工具链坑**：规范形式的 `in payload` 参数在本机 **DXC 1.8 上过不了 DXIL 验证器**（payload 未被降级到 TGSM）。用 `-Vd` + `-Fc` dump IR 定位，改用手动 `groupshared` payload 绕过。另有 `Non-Dominating DispatchMesh call`：`DispatchMesh` 必须全组统一调用
+  - **诚实结论**：本测试场景只剔掉 1/13 个 meshlet，**收益很小** —— 场景本身几乎没有可剔除的几何。与 M13/M15/M17 的结论一致
+  - 已知 Limitation 7 条见学习笔记 M19 第 7 节
+- 尚未实现 AS 内的 HZB 遮挡剔除、per-meshlet LOD、two-phase occlusion culling 与 per-LOD 遮挡剔除。
 
 ## 技术栈
 

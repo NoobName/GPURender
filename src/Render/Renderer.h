@@ -15,6 +15,8 @@
 #include "Render/GPUProfiler.h"
 #include "Render/GPUFrustumCuller.h"
 #include "Render/MeshLOD.h"
+#include "Render/MeshletBuilder.h"
+#include "Render/MeshletResources.h"
 #include "Render/HierarchicalZBuffer.h"
 #include "Render/HZBOcclusionCuller.h"
 #include "Render/IndirectDrawCommands.h"
@@ -80,6 +82,14 @@ struct FrameStats
     // 因为「CPU 提交了几次」正是本里程碑要压缩的对象。
     std::uint32_t indirectExecuteCount = 0; // CPU 侧 ExecuteIndirect 调用次数（0 或 1）
     bool gpuDriven = false;                 // 本帧用的是哪条渲染路径
+
+    // M18：Mesh Shader 路径的统计。
+    // 与 indirectExecuteCount 刻意分开 —— 「DispatchMesh 了几次」和
+    // 「ExecuteIndirect 了几次」是两条完全不同的提交机制，混在一起就失去意义。
+    bool meshShaderPath = false;             // 本帧走的是 Mesh Shader 路径
+    std::uint32_t meshShaderDispatchCount = 0; // CPU 侧 DispatchMesh 调用次数（恒为 0 或 1）
+    std::uint32_t meshletsDispatched = 0;      // 本次 DispatchMesh 覆盖的 meshlet 数
+    std::uint32_t asGroupCount = 0;            // M19：AS 线程组数 = ceil(meshlet数 / 32)
 };
 
 // 每帧独立的资源与同步状态。
@@ -110,7 +120,7 @@ class Renderer
 {
 public:
     static constexpr UINT kFrameCount = 3;         // 三重缓冲
-    static constexpr UINT kMaxTextures = 48;       // CBV/SRV/UAV 描述符堆容量
+    static constexpr UINT kMaxTextures = 56;       // CBV/SRV/UAV 描述符堆容量
 
     // 描述符堆里的槽位分配（CBV_SRV_UAV 是同一种堆类型，SRV 与 UAV 混排）
     //
@@ -149,11 +159,24 @@ public:
     // 每实例 LOD UAV（M16，仅可视化用）。由 GPUFrustumCuller 写入。
     static constexpr UINT kInstanceLodUavSlot = 43;
 
+    // M17：Meshlet 的 4 个 SRV，**必须连续**（MeshletResources 按 firstSrvSlot + offset 计算）。
+    //   44 = MeshletGPU 数组
+    //   45 = UniqueVertexIndices
+    //   46 = PrimitiveIndices
+    //   47 = CullData（包围球 + 法线锥）
+    static constexpr UINT kMeshletSrvSlot = 44; // 44..47，正好用到 kMaxTextures-1
+
+    // M18：Mesh Shader 读顶点数据用的 SRV（StructuredBuffer<MeshVertex>，stride 32）。
+    //   放在 48 是为了让 t0..t4 落在**连续的 44..48**，从而能用一张根描述符表绑定全部五个
+    //   —— 描述符表只能取堆里的连续区间。为此 kMaxTextures 从 48 提到 56。
+    static constexpr UINT kMeshletVertexSrvSlot = 48;
+
     // 渲染模式：CPU 逐实例提交 vs GPU-Driven ExecuteIndirect
     enum class RenderMode
     {
-        CpuDriven, // CPU 对每个可见实例发一次 SetCBV + DrawIndexedInstanced
-        GpuDriven, // CPU 只发一次 ExecuteIndirect；命令数量由 GPU 的计数器决定
+        CpuDriven,  // CPU 对每个可见实例发一次 SetCBV + DrawIndexedInstanced
+        GpuDriven,  // CPU 只发一次 ExecuteIndirect；命令数量由 GPU 的计数器决定
+        MeshShader, // M18：DispatchMesh，几何由 Mesh Shader 自己组装
     };
     static constexpr UINT kMaxInstances = 100000;  // 常量缓冲按此规模预分配
     static constexpr UINT kConstantStride = 256;   // 每个实例的常量槽位（CBV 256 字节对齐）
@@ -171,7 +194,8 @@ public:
                     bool gpuDriven = false, bool depthPrepass = true,
                     bool depthVisualize = false, bool hzbVisualize = false,
                     std::uint32_t hzbMip = 0, bool occlusion = true,
-                    bool occlusionViz = false);
+                    bool occlusionViz = false, bool meshShaderSupported = false,
+                    bool startInMeshShaderMode = false);
     void Shutdown();
     void Render();
 
@@ -249,6 +273,11 @@ private:
     ComPtr<ID3D12Resource> m_backBuffers[kFrameCount];
     FrameContext m_frames[kFrameCount];
     ComPtr<ID3D12GraphicsCommandList> m_commandList;
+
+    // M18：DispatchMesh 声明在 ID3D12GraphicsCommandList6 上，基接口没有。
+    // 命令列表本身早就实现了它，所以初始化时 QueryInterface 一次并缓存，
+    // 避免每帧都做一次接口查询。
+    ComPtr<ID3D12GraphicsCommandList6> m_commandList6;
     ComPtr<ID3D12Fence> m_fence;
     UINT64 m_fenceValue = 0; // 下一个要 Signal 的 Fence 值
     HANDLE m_fenceEvent = nullptr;
@@ -318,6 +347,73 @@ private:
     bool CreateGpuDrivenRootSignature(ID3D12Device* device);
     bool CreateGpuDrivenPipelineState(ID3D12Device* device);
 
+    // ---- M18：Mesh Shader 渲染路径 ----
+    //
+    // 这是一条**独立**的路径，与上面两条并存：
+    //   * 它有自己的根签名与 PSO（Mesh Shader 不能复用图形管线的 PSO）；
+    //   * 它渲染的是**被 meshlet 化的那个网格**（sphere.obj），
+    //     而 CPU-Driven / ExecuteIndirect 两条路径渲染的是实例化立方体场景。
+    //
+    // 为什么让它渲染同一个球体的「传统 indexed 版本」作为对照：
+    //   验收要求「同一个 Mesh 可以通过 Mesh Shader 正确渲染」。
+    //   只画一遍无法判断对错 —— 必须有一个用传统路径画出来的**同源参照物**，
+    //   按 M 切换两条路径时画面应当**完全一致**，这才是可验证的「正确」。
+    ComPtr<ID3D12RootSignature> m_meshShaderRootSignature;
+    ComPtr<ID3D12PipelineState> m_meshShaderPipelineState;
+
+    // sphere.obj 的 GPU 网格（顶点 + 索引）。
+    // Mesh Shader 只用它的**顶点缓冲**（通过 SRV 读），索引缓冲留给传统路径对照渲染。
+    Mesh m_meshletSphereMesh;
+    std::uint32_t m_meshletSphereVertexCount = 0;
+
+    // 能力标志：由 D3D12Context 查询到的 MeshShaderTier 决定。
+    // 为 false 时 MeshShader 模式**不可进入**（M 键会跳过它）——
+    // 这就是任务要求的 Feature Fallback。
+    bool m_meshShaderSupported = false;
+
+    bool CreateMeshShaderRootSignature(ID3D12Device* device);
+    bool CreateMeshShaderPipelineState(ID3D12Device* device);
+    void RecordMeshShaderDraw(const DirectX::XMMATRIX& viewProj);
+
+    // ---- M19：Amplification Shader 的 meshlet 级剔除 ----
+    //
+    // 一个 AS 线程组处理 kAsGroupSize 个 meshlet（一线程一 meshlet）。
+    // **必须与 shaders/MeshletAS.hlsl 里的 AS_GROUP_SIZE 保持一致** ——
+    // 不一致会导致 CPU 发的组数与 AS 的假设错位，表现为部分 meshlet 从未被剔除测试。
+    static constexpr std::uint32_t kAsGroupSize = 32;
+
+    // AS 每帧写出的剔除统计（CPU 延迟若干帧读回，避免阻塞 GPU）
+    struct MeshletCullStats
+    {
+        std::uint32_t frustumCulled = 0;    // 被视锥剔除的 meshlet 数
+        std::uint32_t coneCulled = 0;       // 被法线锥剔除的 meshlet 数
+        std::uint32_t visible = 0;          // 通过全部剔除的 meshlet 数
+        std::uint32_t visibleTriangles = 0; // 这些 meshlet 包含的三角形总数
+        std::uint32_t totalMeshlets = 0;    // 全场 meshlet 数（CPU 侧已知）
+        std::uint32_t totalTriangles = 0;   // 全场三角形数（CPU 侧已知）
+        // 每个 meshlet 的剔除状态：0 = 可见，1 = 视锥剔除，2 = 法线锥剔除。
+        // 调试可视化用它给包围球着色 —— 只看统计数字无法判断「剔除的位置对不对」。
+        std::vector<std::uint32_t> meshletStatus;
+        bool valid = false;
+    };
+    MeshletCullStats m_meshletCullStats;
+
+    // M19：两级剔除各自的开关，便于 A/B 验证「关掉某一级会怎样」
+    bool m_meshletFrustumCullingEnabled = true;
+    bool m_meshletConeCullingEnabled = true;
+
+    // GPU 侧剔除统计缓冲：前 16 字节是 4 个计数器，之后是每 meshlet 的状态。
+    ComPtr<ID3D12Resource> m_cullStatsBuffer;                // DEFAULT（UAV 写 / COPY 读写）
+    ComPtr<ID3D12Resource> m_cullStatsReadback[kFrameCount]; // READBACK
+    ComPtr<ID3D12Resource> m_cullStatsZero;                  // UPLOAD，全零，每帧拷贝清零
+    D3D12_RESOURCE_STATES m_cullStatsState = D3D12_RESOURCE_STATE_COMMON;
+    std::uint32_t m_cullStatsReadbackFrame[kFrameCount] = {};
+    std::uint32_t m_cullStatsFrameCounter = 0;
+    std::uint32_t m_cullStatsByteSize = 0;
+
+    bool CreateMeshletCullStats(ID3D12Device* device, std::uint32_t meshletCount);
+    void ReadbackMeshletCullStats();
+
     // 用 GPU-Driven 路径记录绘制（一次 ExecuteIndirect 提交全部可见实例）。
     // 用 GPU-Driven 路径记录绘制（一次 ExecuteIndirect 提交全部可见实例）。
     // visibleCount 是本帧 CPU 侧的可见数，只用作 MaxCommandCount 的**上限**；
@@ -337,6 +433,17 @@ private:
     void RecordHZBBuild();
     // 可视化指定的 HZB mip 级。
     void RecordHZBVisualization();
+
+    // ---- M17：Meshlet 预处理（Microsoft DirectXMesh）----
+    //
+    // 这里只持有 CPU 侧结果；GPU 上传由 MeshletResources 负责。
+    // 预处理发生在**加载期**（CreateAssets），不在每帧 ——
+    // 聚类是 O(n log n) 级别的离线工作，放进帧循环毫无意义。
+    MeshletBuilder m_meshletBuilder;
+    MeshletResources m_meshletResources;
+
+    // 每个 meshlet 的包围球按索引着色（M17 可视化）。J 键切换。
+    bool m_meshletVisualizationEnabled = false;
 
     // ---- M16：GPU-Driven LOD ----
     // LOD 链元数据（CPU 生成，上传到 GPU 供剔除 CS 读取）

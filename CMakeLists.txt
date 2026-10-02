@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.24)
 
 project(GPUDrivenRenderer VERSION 0.1.0 LANGUAGES CXX)
 
@@ -37,12 +37,38 @@ add_executable(GPUDrivenRenderer
     src/Render/HierarchicalZBuffer.cpp
     src/Render/HZBOcclusionCuller.cpp
     src/Render/MeshLOD.cpp
+    src/Render/MeshletBuilder.cpp
+    src/Render/MeshletResources.cpp
     src/Asset/ObjLoader.cpp
     src/Asset/TgaLoader.cpp
     src/Scene/Scene.cpp
+
+    # ---- Microsoft DirectXMesh（M17）-----------------------------------------
+    # 只编译 meshlet 预处理实际需要的两个翻译单元，而不是把整个库拉进来：
+    #   DirectXMeshletGenerator.cpp -> ComputeMeshlets / ComputeCullData
+    #   DirectXMeshAdjacency.cpp    -> GenerateAdjacencyAndPointReps
+    #                                   （ComputeMeshlets 在未传 adjacency 时内部调用它）
+    # 其余 .cpp（Normals / Optimize* / Remap / VBReader / Validate ...）本项目用不到，
+    # 刻意不加入，避免无谓的编译时间与代码体积。
+    third_party/DirectXMesh/DirectXMeshletGenerator.cpp
+    third_party/DirectXMesh/DirectXMeshAdjacency.cpp
 )
 
-target_include_directories(GPUDrivenRenderer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(GPUDrivenRenderer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # DirectXMesh 的公开头（DirectXMesh.h / .inl）与内部头（DirectXMeshP.h / scoped.h）
+    # 都在同一目录，按原样 include，不做任何路径改写。
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/DirectXMesh
+)
+
+# 第三方库不参与本项目的 /W4 洁癖：DirectXMesh 的 P.h 自带一批 pragma warning(disable)，
+# 但从 /W4 降到 /W3 可以避免它的旧式代码在 /permissive- 下产生噪音，
+# 从而让「本项目代码零警告」这个约束仍然有意义。
+set_source_files_properties(
+    third_party/DirectXMesh/DirectXMeshletGenerator.cpp
+    third_party/DirectXMesh/DirectXMeshAdjacency.cpp
+    PROPERTIES COMPILE_OPTIONS "/W3;/permissive"
+)
 
 # 把 HLSL 源文件与测试资源复制到构建目录：
 #   shaders/ -> 运行时由 ShaderCompiler 从 exe 同级目录加载

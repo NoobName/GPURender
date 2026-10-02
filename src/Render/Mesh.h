@@ -32,6 +32,10 @@ public:
     const D3D12_INDEX_BUFFER_VIEW& GetIndexBufferView() const { return m_indexBufferView; }
     UINT GetIndexCount() const { return m_indexCount; }
 
+    // M18：Mesh Shader 通过 SRV 读顶点（没有 Input Assembler），
+    // 所以需要暴露底层资源来建视图。绑定用的 VBV 仍然保留给传统路径。
+    ID3D12Resource* GetVertexBufferResource() const { return m_vertexBuffer.GetResource(); }
+
 private:
     GPUBuffer m_vertexBuffer;
     GPUBuffer m_indexBuffer;
